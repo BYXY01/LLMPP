@@ -17,6 +17,7 @@ Plugin -> PluginManager : plugin part, drop .py files to add tools & hooks
   - `compatible` — text-protocol fallback for models without tools support.
 - **Hooks** — inbound/outbound message processors (1 each, chosen in config).
 - **Plugin deps** — a plugin can declare `__deps__` and LLMPP auto-installs them.
+- **Streaming** (experimental) — native mode supports SSE streaming, gated by `server.stream`.
 - **Any LLM backend** — OpenAI, LM Studio, Ollama, vLLM, etc. (any OpenAI-compatible base URL).
 
 ## Quick Start
@@ -41,7 +42,8 @@ python LLMPP.py
 {
     "server": {
         "host": "127.0.0.1",
-        "port": 55677
+        "port": 55677,
+        "stream": false
     },
     "llm": {
         "api_base": "http://127.0.0.1:11434/v1",
@@ -59,6 +61,7 @@ python LLMPP.py
 | Field | Description |
 |-------|-------------|
 | `server.host` / `server.port` | Bind address and port. `port` is required. |
+| `server.stream` | Enable SSE streaming (experimental, native mode only). |
 | `llm.api_base` / `api_key` | Your OpenAI-compatible backend (LM Studio, Ollama, vLLM, ...). |
 | `mode` | `native` (function calling) or `compatible` (text protocol). |
 | `hooks.inbound` / `hooks.outbound` | Name of the inbound/outbound hook plugin to use. |
@@ -153,4 +156,4 @@ print(resp.choices[0].message.content)
 
 ## Status
 
-Alpha (`v0.0.10`). Core features work; streaming, request auth, and tool-failure limits are planned.
+Alpha (`v0.0.11`). Core features work; streaming (experimental), request auth, and tool-failure limits are in progress.

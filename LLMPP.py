@@ -47,13 +47,14 @@ log = logging.getLogger("LLMPP")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-VERSION = "0.0.10-alpha"
+VERSION = "0.0.11-alpha"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "server": {
         "host": "127.0.0.1",
         # "host": "0.0.0.0",  # expose to network
         # "port": 55677,  # required: LLMPP phone-keypad encoding, uncomment and set
+        "stream": False,
     },
     "llm": {
         "api_base": "http://127.0.0.1:11434/v1",
@@ -283,7 +284,10 @@ class LLM_Server:
         if not model:
             return jsonify({"error": {"message": "model must be specified in request", "type": "invalid_request_error"}}), 400
 
+        stream = bool(payload.get("stream")) and self.cfg["server"].get("stream", False)
         try:
+            if stream:
+                return self._handle_stream(model, messages)
             if self.cfg["mode"] == "compatible":
                 content = self._run_compatible(model, messages)
             else:
@@ -312,6 +316,71 @@ class LLM_Server:
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             }
         )
+
+    def _handle_stream(self, model: str, messages: List[Dict[str, Any]]):
+        """Handle a streaming request (tools are resolved internally, text is streamed)."""
+        from flask import Response
+
+        if self.cfg["mode"] == "compatible":
+            # Compatible mode does not stream; fall back to a plain response.
+            content = self._run_compatible(model, messages)
+            content = self.manager.run_outbound(self.cfg, content)
+            created = int(time.time())
+            return jsonify(
+                {
+                    "id": f"chatcmpl-{created}",
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": content},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            )
+
+        content = self._run_native(model, messages)
+        content = self.manager.run_outbound(self.cfg, content)
+
+        def generate():
+            created = int(time.time())
+            yield self._sse(
+                {
+                    "id": f"chatcmpl-{created}",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+                }
+            )
+            yield self._sse(
+                {
+                    "id": f"chatcmpl-{created}",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+                }
+            )
+            yield self._sse(
+                {
+                    "id": f"chatcmpl-{created}",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+            )
+            yield "data: [DONE]\n\n"
+
+        return Response(generate(), mimetype="text/event-stream")
+
+    @staticmethod
+    def _sse(payload: Dict[str, Any]) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     # --- LLM calls ---------------------------------------------------------
 

@@ -17,6 +17,7 @@ Plugin -> PluginManager : 插件部分，丢 .py 文件即可添加工具与处�
   - `compatible` — 文本协议回退，适用于不支持 tools 的模型。
 - **消息处理器** — 入站 / 出站处理器各 1 个，在配置中指定。
 - **插件依赖** — 插件可声明 `__deps__`，LLMPP 自动安装。
+- **流式输出**（实验）— native 模式支持 SSE 流式，由 `server.stream` 开关控制。
 - **任意 LLM 后端** — OpenAI、LM Studio、Ollama、vLLM 等（任何 OpenAI 兼容 base URL）。
 
 ## 快速开始
@@ -41,7 +42,8 @@ python LLMPP.py
 {
     "server": {
         "host": "127.0.0.1",
-        "port": 55677
+        "port": 55677,
+        "stream": false
     },
     "llm": {
         "api_base": "http://127.0.0.1:11434/v1",
@@ -59,6 +61,7 @@ python LLMPP.py
 | 字段 | 说明 |
 |------|------|
 | `server.host` / `server.port` | 监听地址与端口。`port` 必填。 |
+| `server.stream` | 启用 SSE 流式（实验，仅 native 模式）。 |
 | `llm.api_base` / `api_key` | 你的 OpenAI 兼容后端（LM Studio、Ollama、vLLM 等）。 |
 | `mode` | `native`（函数调用）或 `compatible`（文本协议）。 |
 | `hooks.inbound` / `hooks.outbound` | 使用的入站 / 出站处理器插件名。 |
@@ -153,4 +156,4 @@ print(resp.choices[0].message.content)
 
 ## 状态
 
-Alpha（`v0.0.10`）。核心功能可用；流式输出、请求鉴权、工具失败上限为计划项。
+Alpha（`v0.0.11`）。核心功能可用；流式输出（实验）、请求鉴权、工具失败上限进行中。
