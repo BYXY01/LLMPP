@@ -342,41 +342,7 @@ class LLM_Server:
                 }
             )
 
-        content = self._run_native(model, messages)
-        content = self.manager.run_outbound(self.cfg, content)
-
-        def generate():
-            created = int(time.time())
-            yield self._sse(
-                {
-                    "id": f"chatcmpl-{created}",
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
-                }
-            )
-            yield self._sse(
-                {
-                    "id": f"chatcmpl-{created}",
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-                }
-            )
-            yield self._sse(
-                {
-                    "id": f"chatcmpl-{created}",
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                }
-            )
-            yield "data: [DONE]\n\n"
-
-        return Response(generate(), mimetype="text/event-stream")
+        return Response(self._run_native_stream(model, messages), mimetype="text/event-stream")
 
     @staticmethod
     def _sse(payload: Dict[str, Any]) -> str:
@@ -389,50 +355,120 @@ class LLM_Server:
         model: str,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
+        stream: bool = False,
     ) -> Any:
         kwargs: Dict[str, Any] = {"model": model, "messages": messages}
         if tools:
             kwargs["tools"] = tools
+        if stream:
+            kwargs["stream"] = True
         resp = self.client.chat.completions.create(**kwargs)
+        if stream:
+            return resp
         return resp.choices[0].message
 
     def _run_native(self, model: str, messages: List[Dict[str, Any]]) -> str:
-        """Native tool-calling protocol."""
+        """Native tool-calling protocol (non-streaming)."""
         tools = self.manager.tools()
         max_rounds = 10
         for _ in range(max_rounds):
             msg = self._call(model, messages, tools=tools)
             if not msg.tool_calls:
                 return msg.content or ""
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": msg.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in msg.tool_calls
-                    ],
-                }
-            )
-            for tc in msg.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                result = self.manager.call(tc.function.name, args)
-                log.info(f"[tool] {tc.function.name}({args}) -> {result}")
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": result}
-                )
+            self._apply_tool_calls(messages, msg.tool_calls)
         log.warning(f"Tool call exceeded {max_rounds} rounds, forcing stop")
         return ""
+
+    def _apply_tool_calls(self, messages: List[Dict[str, Any]], tool_calls) -> None:
+        """Record assistant tool_calls and append tool results to messages."""
+        messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+        )
+        for tc in tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result = self.manager.call(tc.function.name, args)
+            log.info(f"[tool] {tc.function.name}({args}) -> {result}")
+            messages.append(
+                {"role": "tool", "tool_call_id": tc.id, "content": result}
+            )
+
+    def _run_native_stream(self, model: str, messages: List[Dict[str, Any]]):
+        """Native tool-calling protocol (streaming).
+
+        Tool-decision rounds run non-streaming; only the final text round
+        streams token-by-token. Yields SSE chunk strings.
+        """
+        tools = self.manager.tools()
+        max_rounds = 10
+        created = int(time.time())
+        sse_id = f"chatcmpl-{created}"
+        for _ in range(max_rounds):
+            msg = self._call(model, messages, tools=tools)
+            if not msg.tool_calls:
+                yield self._sse(
+                    {
+                        "id": sse_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+                    }
+                )
+                stream = self._call(model, messages, tools=tools, stream=True)
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    if delta and delta.content:
+                        yield self._sse(
+                            {
+                                "id": sse_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"content": delta.content}, "finish_reason": None}],
+                            }
+                        )
+                yield self._sse(
+                    {
+                        "id": sse_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                )
+                yield "data: [DONE]\n\n"
+                return
+            self._apply_tool_calls(messages, msg.tool_calls)
+        log.warning(f"Tool call exceeded {max_rounds} rounds, forcing stop")
+        yield self._sse(
+            {
+                "id": sse_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+        )
+        yield "data: [DONE]\n\n"
 
     def _run_compatible(self, model: str, messages: List[Dict[str, Any]]) -> str:
         """Text-protocol mode for models without tools support."""
@@ -505,12 +541,12 @@ def load_config() -> Dict[str, Any]:
     return cfg
 
 
-def save_config(cfg: Dict[str, Any]) -> None:
+def save_config(cfg: Dict[str, Any]):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=4)
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="LLMPP - LLM Plugin Proxy")
     parser.add_argument("--gen-config", action="store_true", help="Generate default config only")
     args = parser.parse_args()
