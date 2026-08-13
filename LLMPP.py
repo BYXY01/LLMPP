@@ -201,17 +201,21 @@ class PluginManager:
                 log.error(f"Inbound hook {name} error: {e}")
         return messages
 
-    def run_outbound(self, cfg: Dict[str, Any], response: str) -> str:
-        """Run the outbound hook (after the LLM replies, before returning)."""
+    def run_outbound(self, cfg: Dict[str, Any], messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Run the outbound hook (after the LLM replies, before returning).
+
+        Receives the full message list like inbound; if the hook returns a
+        list it is used, otherwise the original list is returned unchanged.
+        """
         name = cfg["hooks"].get("outbound")
         if name and name in self.hooks:
             try:
-                result = self.hooks[name](response)
-                if isinstance(result, str):
+                result = self.hooks[name](messages)
+                if isinstance(result, list):
                     return result
             except Exception as e:
                 log.error(f"Outbound hook {name} error: {e}")
-        return response
+        return messages
 
 
 manager = PluginManager()
@@ -289,16 +293,21 @@ class LLM_Server:
             if stream:
                 return self._handle_stream(model, messages)
             if self.cfg["mode"] == "compatible":
-                content = self._run_compatible(model, messages)
+                content, reply_messages = self._run_compatible(model, messages)
             else:
-                content = self._run_native(model, messages)
+                content, reply_messages = self._run_native(model, messages)
         except Exception as e:
             log.error(f"LLM call failed: {e}")
             return jsonify(
                 {"error": {"message": f"LLM call failed: {e}", "type": "upstream_error"}}
             ), 502
 
-        content = self.manager.run_outbound(self.cfg, content)
+        reply_messages = self.manager.run_outbound(self.cfg, reply_messages)
+        content = ""
+        for m in reversed(reply_messages):
+            if m.get("role") == "assistant" and m.get("content"):
+                content = m["content"]
+                break
         created = int(time.time())
         return jsonify(
             {
@@ -306,6 +315,7 @@ class LLM_Server:
                 "object": "chat.completion",
                 "created": created,
                 "model": model,
+                "messages": reply_messages,
                 "choices": [
                     {
                         "index": 0,
@@ -323,8 +333,13 @@ class LLM_Server:
 
         if self.cfg["mode"] == "compatible":
             # Compatible mode does not stream; fall back to a plain response.
-            content = self._run_compatible(model, messages)
-            content = self.manager.run_outbound(self.cfg, content)
+            content, reply_messages = self._run_compatible(model, messages)
+            reply_messages = self.manager.run_outbound(self.cfg, reply_messages)
+            content = ""
+            for m in reversed(reply_messages):
+                if m.get("role") == "assistant" and m.get("content"):
+                    content = m["content"]
+                    break
             created = int(time.time())
             return jsonify(
                 {
@@ -332,6 +347,7 @@ class LLM_Server:
                     "object": "chat.completion",
                     "created": created,
                     "model": model,
+                    "messages": reply_messages,
                     "choices": [
                         {
                             "index": 0,
@@ -367,17 +383,29 @@ class LLM_Server:
             return resp
         return resp.choices[0].message
 
-    def _run_native(self, model: str, messages: List[Dict[str, Any]]) -> str:
-        """Native tool-calling protocol (non-streaming)."""
+    def _run_native(self, model: str, messages: List[Dict[str, Any]]):
+        """Native tool-calling protocol (non-streaming).
+
+        Returns (content, reply_messages): content is the final text;
+        reply_messages is the client-facing conversation list with tool
+        records stripped (tools are resolved internally and hidden).
+        """
         tools = self.manager.tools()
         max_rounds = 10
         for _ in range(max_rounds):
             msg = self._call(model, messages, tools=tools)
             if not msg.tool_calls:
-                return msg.content or ""
+                content = msg.content or ""
+                messages.append({"role": "assistant", "content": content})
+                reply = [
+                    m
+                    for m in messages
+                    if m.get("role") != "tool" and not m.get("tool_calls")
+                ]
+                return content, reply
             self._apply_tool_calls(messages, msg.tool_calls)
         log.warning(f"Tool call exceeded {max_rounds} rounds, forcing stop")
-        return ""
+        return "", [m for m in messages if m.get("role") != "tool" and not m.get("tool_calls")]
 
     def _apply_tool_calls(self, messages: List[Dict[str, Any]], tool_calls) -> None:
         """Record assistant tool_calls and append tool results to messages."""
@@ -470,8 +498,13 @@ class LLM_Server:
         )
         yield "data: [DONE]\n\n"
 
-    def _run_compatible(self, model: str, messages: List[Dict[str, Any]]) -> str:
-        """Text-protocol mode for models without tools support."""
+    def _run_compatible(self, model: str, messages: List[Dict[str, Any]]):
+        """Text-protocol mode for models without tools support.
+
+        Returns (content, reply_messages): content is the final text;
+        reply_messages is the client-facing list with the injected protocol
+        prompt (index 0) removed, keeping the tool-call records.
+        """
         funcs = "\n".join(
             f"- {name}: {inspect.getdoc(func) or ''}"
             for name, func in self.manager.plugins.items()
@@ -489,7 +522,8 @@ class LLM_Server:
             msg = self._call(model, messages)
             content = (msg.content or "").strip()
             if not content.startswith("{"):
-                return content
+                messages.append({"role": "assistant", "content": content})
+                return content, messages[1:]
             try:
                 req = json.loads(content)
                 name = req.get("call_function")
@@ -510,9 +544,9 @@ class LLM_Server:
                 )
             except Exception as e:
                 log.warning(f"Protocol parse failed: {e}, raw reply: {content[:200]}")
-                return content
+                return content, messages[1:]
         log.warning(f"Tool call exceeded {max_rounds} rounds, forcing stop")
-        return ""
+        return "", messages[1:]
 
     def run(self, host: str, port: int) -> None:
         self.app.run(host=host, port=port, debug=False)
@@ -522,7 +556,7 @@ class LLM_Server:
 # Config & entry point
 # ---------------------------------------------------------------------------
 
-def load_config() -> Dict[str, Any]:
+def load_config():
     """Load config, generate default if missing."""
     if not os.path.exists(CONFIG_PATH):
         save_config(DEFAULT_CONFIG)
