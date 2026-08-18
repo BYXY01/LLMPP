@@ -14,10 +14,11 @@ Plugin -> PluginManager : 插件部分，丢 .py 文件即可添加工具与处�
 - **即插即用插件** — 把 `.py` 文件丢进 `plugins/`，启动时自动加载。
 - **双协议**：
   - `native` — 原生 OpenAI function/tool calling。
-  - `compatible` — 文本协议回退，适用于不支持 tools 的模型。
-- **消息处理器** — 入站 / 出站处理器各 1 个，在配置中指定。
+  - `compatible` — 不支持 tools 模型的回退，含双层降级（结构化 JSON schema，再提示词 + 容错解析）。
+- **消息处理器** — 入站 / 出站处理器各 1 个，在配置中指定；出站支持可选流式块。
 - **插件依赖** — 插件可声明 `__deps__`，LLMPP 自动安装。
-- **流式输出**（实验）— native 模式支持 SSE 流式，由 `server.stream` 开关控制。
+- **流式输出**（实验）— native 模式支持 SSE 流式（逐 token），由 `server.stream` 开关控制。
+- **调用者工具** — 合并客户端提供的 `tools`；调用者自有工具回传给客户端执行（标准 agentic 循环）。
 - **任意 LLM 后端** — OpenAI、LM Studio、Ollama、vLLM 等（任何 OpenAI 兼容 base URL）。
 
 ## 快速开始
@@ -51,6 +52,9 @@ python LLMPP.py
         "timeout": 120
     },
     "mode": "native",
+    "tools": {
+        "max_rounds": 10
+    },
     "hooks": {
         "inbound": "",
         "outbound": ""
@@ -64,6 +68,7 @@ python LLMPP.py
 | `server.stream` | 启用 SSE 流式（实验，仅 native 模式）。 |
 | `llm.api_base` / `api_key` | 你的 OpenAI 兼容后端（LM Studio、Ollama、vLLM 等）。 |
 | `mode` | `native`（函数调用）或 `compatible`（文本协议）。 |
+| `tools.max_rounds` | 单次请求内工具调用轮数上限（防死循环安全阀）。 |
 | `hooks.inbound` / `hooks.outbound` | 使用的入站 / 出站处理器插件名。 |
 
 模型名**不在**这里配置——由客户端在每次请求中传入，与标准 OpenAI API 一致。
@@ -114,9 +119,14 @@ def inbound(messages):
     return messages
 
 
-def outbound(response):
-    """在 LLM 回复返回用户前执行。"""
-    return response
+def outbound(messages, stream_chunk=None):
+    """在 LLM 回复返回用户前执行。
+
+    接收完整回复消息列表。流式时 `stream_chunk` 携带当前文本块，
+    hook 应返回 (处理后的消息列表, 处理后的块)；否则返回列表。
+    不带 stream_chunk 参数的 hook 在流式时会被跳过。
+    """
+    return messages
 
 
 __hooks__ = [inbound, outbound]
@@ -151,9 +161,11 @@ print(resp.choices[0].message.content)
 
 ## 工作原理
 
-- **native 模式**：LLMPP 把插件 schema 作为 `tools` 发送；模型要求调用工具时，LLMPP 执行并以 `tool` 消息回填结果。
-- **compatible 模式**：LLMPP 注入描述工具与 JSON 约定的 system 提示。若模型回复 `{"call_function": "...", "arg": {...}}`，LLMPP 执行工具并返回 `tool_result:...`；非 JSON 回复则直接返回给用户。
+- **native 模式**：LLMPP 合并插件 schema（及客户端提供的 `tools`）作为 `tools` 发送。LLMPP 插件工具在内部执行；调用者自有工具回传给客户端执行（标准 agentic 循环）。
+- **compatible 模式**：双层降级——先结构化 JSON schema 输出（无提示词注入），再提示词注入 + 容错 JSON 提取。工具结果以 `tool_result:...` / JSON 消息回填。
+- 响应包含**完整消息列表**（`messages`），客户端可直接替换历史续轮，不丢上下文。
+- **流式**（仅 native）：文本逐 token 转发，工具调用内部累积执行。
 
 ## 状态
 
-Alpha（`v0.0.11`）。核心功能可用；流式输出（实验）、请求鉴权、工具失败上限进行中。
+Alpha（`v0.0.12`）。核心功能可用；请求鉴权、插件管理为规划项。

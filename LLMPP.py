@@ -47,7 +47,7 @@ log = logging.getLogger("LLMPP")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-VERSION = "0.0.11-alpha"
+VERSION = "0.0.12-alpha"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "server": {

@@ -14,10 +14,11 @@ Plugin -> PluginManager : plugin part, drop .py files to add tools & hooks
 - **Drop-in plugins** — put `.py` files in `plugins/`, they auto-load on startup.
 - **Two protocols**:
   - `native` — native OpenAI function/tool calling.
-  - `compatible` — text-protocol fallback for models without tools support.
-- **Hooks** — inbound/outbound message processors (1 each, chosen in config).
+  - `compatible` — fallback for models without tools support, with a two-tier ladder (structured JSON schema, then prompt + fault-tolerant parsing).
+- **Hooks** — inbound/outbound message processors (1 each, chosen in config). Outbound supports optional streaming chunks.
 - **Plugin deps** — a plugin can declare `__deps__` and LLMPP auto-installs them.
-- **Streaming** (experimental) — native mode supports SSE streaming, gated by `server.stream`.
+- **Streaming** (experimental) — native mode supports SSE streaming (token-by-token), gated by `server.stream`.
+- **Caller tools** — client-provided `tools` are merged; caller-owned tools are passed back to the client to execute (standard agentic loop).
 - **Any LLM backend** — OpenAI, LM Studio, Ollama, vLLM, etc. (any OpenAI-compatible base URL).
 
 ## Quick Start
@@ -51,6 +52,9 @@ python LLMPP.py
         "timeout": 120
     },
     "mode": "native",
+    "tools": {
+        "max_rounds": 10
+    },
     "hooks": {
         "inbound": "",
         "outbound": ""
@@ -64,6 +68,7 @@ python LLMPP.py
 | `server.stream` | Enable SSE streaming (experimental, native mode only). |
 | `llm.api_base` / `api_key` | Your OpenAI-compatible backend (LM Studio, Ollama, vLLM, ...). |
 | `mode` | `native` (function calling) or `compatible` (text protocol). |
+| `tools.max_rounds` | Max tool-call rounds per request (safety valve against loops). |
 | `hooks.inbound` / `hooks.outbound` | Name of the inbound/outbound hook plugin to use. |
 
 The model name is **not** configured here — clients pass it in each request, as with the standard OpenAI API.
@@ -114,9 +119,15 @@ def inbound(messages):
     return messages
 
 
-def outbound(response):
-    """Runs on the LLM reply before returning to the user."""
-    return response
+def outbound(messages, stream_chunk=None):
+    """Runs on the LLM reply before returning.
+
+    Receives the full reply message list. During streaming, `stream_chunk`
+    carries the current text chunk and the hook should return
+    (processed_messages, processed_chunk); otherwise it returns the list.
+    Hooks without a stream_chunk parameter are skipped during streaming.
+    """
+    return messages
 
 
 __hooks__ = [inbound, outbound]
@@ -151,9 +162,11 @@ print(resp.choices[0].message.content)
 
 ## How it works
 
-- `native` mode: LLMPP sends the plugin schemas as `tools`; when the model asks for a tool, LLMPP executes it and feeds the result back as a `tool` message.
-- `compatible` mode: LLMPP injects a system prompt describing the tools and a JSON contract. If the model replies with `{"call_function": "...", "arg": {...}}`, LLMPP runs the tool and returns `tool_result:...`; a non-JSON reply is returned to the user directly.
+- `native` mode: LLMPP merges plugin schemas (and any client-provided `tools`) and sends them as `tools`. Tools owned by LLMPP plugins are executed internally; caller-owned tools are passed back to the client to execute (standard agentic loop).
+- `compatible` mode: a two-tier fallback — first structured JSON schema output (no prompt injection), then prompt injection with fault-tolerant JSON extraction. Tool results are fed back as `tool_result:...` / JSON messages.
+- Responses include the **full message list** (`messages`), so clients can replace their history and continue the conversation without losing context.
+- **Streaming** (native only): text is forwarded token-by-token while tool calls are accumulated and executed internally.
 
 ## Status
 
-Alpha (`v0.0.11`). Core features work; streaming (experimental), request auth, and tool-failure limits are in progress.
+Alpha (`v0.0.12`). Core features work; request auth and plugin management are planned.
