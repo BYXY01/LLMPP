@@ -204,20 +204,31 @@ class PluginManager:
                 log.error(f"Inbound hook {name} error: {e}")
         return messages
 
-    def run_outbound(self, cfg: Dict[str, Any], messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def run_outbound(self, cfg: Dict[str, Any], messages: List[Dict[str, Any]], stream_chunk: Optional[str] = None) -> Any:
         """Run the outbound hook (after the LLM replies, before returning).
 
-        Receives the full message list like inbound; if the hook returns a
-        list it is used, otherwise the original list is returned unchanged.
+        Non-streaming: hook(messages) returns a list -> the new message list.
+
+        Streaming: hook(messages, stream_chunk) returns a (list, chunk) tuple
+        -> (processed messages, processed stream chunk). Hooks without a
+        stream_chunk parameter raise TypeError, which is caught and logged;
+        the original messages are returned unchanged (try/except/continue).
         """
         name = cfg["hooks"].get("outbound")
         if name and name in self.hooks:
+            hook_fn = self.hooks[name]
             try:
-                result = self.hooks[name](messages)
+                if stream_chunk:
+                    r_msg, r_chunk = hook_fn(messages=messages, stream_chunk=stream_chunk)
+                    r_msg = r_msg if isinstance(r_msg, list) else messages
+                    return r_msg, r_chunk
+                result = hook_fn(messages)
                 if isinstance(result, list):
                     return result
             except Exception as e:
                 log.error(f"Outbound hook {name} error: {e}")
+                if stream_chunk:
+                    return messages, None
         return messages
 
 
@@ -296,32 +307,244 @@ class LLM_Server:
 
         stream = bool(payload.get("stream")) and self.cfg["server"].get("stream", False)
         client_tools = payload.get("tools")
-        try:
-            if stream:
-                return self._handle_stream(model, messages)
+
+        if stream:
             if self.cfg["mode"] == "compatible":
-                content, reply_messages, pending_tool_calls = self._run_compatible(model, messages)
+                # Compatible mode does not stream; return plain response directly.
+                return self._run_pipeline(model, messages, client_tools)
+            from flask import Response
+
+            return Response(self._stream_native(model, messages, client_tools), mimetype="text/event-stream")
+
+        return self._run_pipeline(model, messages, client_tools)
+
+    def _run_pipeline(self, model: str, messages: List[Dict[str, Any]], client_tools: Optional[List[Dict[str, Any]]]):
+        """Unified non-streaming pipeline: mode dispatch in one loop.
+
+        Native and compatible are branches inside a single message loop.
+        Returns the Flask response.
+        """
+        created = int(time.time())
+        max_rounds = self.cfg["tools"].get("max_rounds", 10)
+        pending_tool_calls = None
+        final_content = ""
+        reply_messages = list(messages)
+
+        try:
+            if self.cfg["mode"] == "compatible":
+                # ---- Compatible mode (inlined) ----
+                # Mode 1: structured json_schema, no prompt injection.
+                try:
+                    response_format = self._compat_schema()
+                    m1 = self._encode_mode1(list(messages))
+                    for _ in range(max_rounds):
+                        msg1 = self._call(model, m1, response_format=response_format)
+                        c1 = (msg1.content or "").strip()
+                        p1 = self._parse_compat(c1)
+                        if p1 is None:
+                            break
+                        a1, a1_args = p1
+                        if a1 == "reply":
+                            t1 = a1_args.get("text") if isinstance(a1_args, dict) else a1_args
+                            if not t1:
+                                break
+                            m1.append({"role": "assistant", "content": str(t1)})
+                            final_content, reply_messages, pending_tool_calls = str(t1), m1, None
+                            break
+                        if a1 not in self.manager.plugins:
+                            break
+                        m1.append({"role": "assistant", "content": c1})
+                        r1 = self.manager.call(a1, a1_args)
+                        log.info(f"[tool] {a1}({a1_args}) -> {r1}")
+                        m1.append(
+                            {
+                                "role": "user",
+                                "content": json.dumps({"type": "tool_result", "content": r1}, ensure_ascii=False),
+                            }
+                        )
+                    else:
+                        log.warning("Compatible mode1: max rounds exceeded")
+                except Exception as e:
+                    log.warning(f"Compatible mode1 failed: {e}")
+
+                # Mode 2 (fallback): prompt injection + fault-tolerant parse.
+                if not final_content:
+                    funcs = "\n".join(
+                        f"- {name}: {inspect.getdoc(func) or ''}"
+                        for name, func in self.manager.plugins.items()
+                    )
+                    m2 = list(messages)
+                    m2.insert(
+                        0,
+                        {
+                            "role": "system",
+                            "content": self.PROMPT_PROTOCOL_TIPS.format(functions=funcs),
+                        },
+                    )
+                    for _ in range(max_rounds):
+                        msg2 = self._call(model, m2)
+                        c2 = (msg2.content or "").strip()
+                        p2 = self._parse_compat(c2)
+                        if p2 is None:
+                            if c2 and not c2.startswith("{"):
+                                m2.append({"role": "assistant", "content": c2})
+                                final_content, reply_messages, pending_tool_calls = c2, m2[1:], None
+                                break
+                            final_content = "[llmpp] compatible mode produced no valid reply"
+                            reply_messages = m2[1:]
+                            pending_tool_calls = None
+                            break
+                        a2, a2_args = p2
+                        if a2 == "reply":
+                            t2 = a2_args.get("text") if isinstance(a2_args, dict) else a2_args
+                            if not t2:
+                                final_content = "[llmpp] compatible mode produced no valid reply"
+                                reply_messages = m2[1:]
+                                pending_tool_calls = None
+                                break
+                            m2.append({"role": "assistant", "content": str(t2)})
+                            final_content, reply_messages, pending_tool_calls = str(t2), m2[1:], None
+                            break
+                        if a2 not in self.manager.plugins:
+                            final_content = "[llmpp] compatible mode produced no valid reply"
+                            reply_messages = m2[1:]
+                            pending_tool_calls = None
+                            break
+                        m2.append({"role": "assistant", "content": c2})
+                        r2 = self.manager.call(a2, a2_args)
+                        log.info(f"[tool] {a2}({a2_args}) -> {r2}")
+                        m2.append({"role": "user", "content": f"tool_result:{r2}"})
+                    else:
+                        log.warning(f"Tool call exceeded {max_rounds} rounds, forcing stop")
             else:
-                content, reply_messages, pending_tool_calls = self._run_native(model, messages, client_tools=client_tools)
+                tools = self.manager.tools()
+                if client_tools:
+                    tools = list(tools) + list(client_tools)
+                for _ in range(max_rounds):
+                    msg = self._call(model, messages, tools=tools)
+                    if not msg.tool_calls:
+                        final_content = msg.content or ""
+                        messages.append({"role": "assistant", "content": final_content})
+                        break
+                    foreign = [tc for tc in msg.tool_calls if tc.function.name not in self.manager.plugins]
+                    if foreign:
+                        pending_tool_calls = list(msg.tool_calls)
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": msg.content,
+                                "tool_calls": [
+                                    {
+                                        "id": tc.id,
+                                        "type": "function",
+                                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                                    }
+                                    for tc in msg.tool_calls
+                                ],
+                            }
+                        )
+                        break
+                    self._apply_tool_calls(messages, msg.tool_calls)
         except Exception as e:
             log.error(f"LLM call failed: {e}")
             return jsonify(
                 {"error": {"message": f"LLM call failed: {e}", "type": "upstream_error"}}
             ), 502
 
-        reply_messages = self.manager.run_outbound(self.cfg, reply_messages)
-        content = self._extract_reply_content(reply_messages)
+        if self.cfg["mode"] == "native":
+            # Native loop mutated `messages`; use it as the reply list.
+            reply_messages = messages
+        return self._respond(model, created, reply_messages, pending_tool_calls)
+
+    @staticmethod
+    def _sse(payload: Dict[str, Any]) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    # --- LLM calls ---------------------------------------------------------
+
+    def _stream_native(self, model: str, messages: List[Dict[str, Any]], client_tools: Optional[List[Dict[str, Any]]]):
+        """Streaming native: token-by-token text, accumulate tool calls.
+
+        Yields SSE strings. Tool calls are executed and fed back until the
+        model produces a plain text reply.
+        """
+        tools = self.manager.tools()
+        if client_tools:
+            tools = list(tools) + list(client_tools)
+        max_rounds = self.cfg["tools"].get("max_rounds", 10)
         created = int(time.time())
+        sse_id = f"chatcmpl-{created}"
+
+        def sse(delta, finish=None):
+            return self._sse(
+                {
+                    "id": sse_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                }
+            )
+
+        yield sse({"role": "assistant", "content": ""})
+
+        for _ in range(max_rounds):
+            tool_acc: Dict[int, Dict[str, str]] = {}
+            gen = self._call(model, messages, tools=tools, stream=True)
+            for chunk in gen:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
+                if delta.content:
+                    r_msg, r_chunk = self.manager.run_outbound(self.cfg, list(messages), stream_chunk=delta.content)
+                    if isinstance(r_msg, list):
+                        messages = r_msg
+                    yield sse({"content": r_chunk if r_chunk is not None else delta.content})
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index if tc.index is not None else 0
+                        slot = tool_acc.setdefault(idx, {"name": "", "args": "", "id": tc.id or ""})
+                        if tc.function:
+                            if tc.function.name:
+                                slot["name"] += tc.function.name
+                            if tc.function.arguments:
+                                slot["args"] += tc.function.arguments
+            if not tool_acc:
+                messages = self.manager.run_outbound(self.cfg, list(messages))
+                yield sse({}, finish="stop")
+                yield "data: [DONE]\n\n"
+                return
+            tool_calls = [
+                {
+                    "id": slot["id"],
+                    "type": "function",
+                    "function": {"name": slot["name"], "arguments": slot["args"]},
+                }
+                for idx, slot in sorted(tool_acc.items())
+            ]
+            self._apply_tool_calls(messages, tool_calls)
+
+        log.warning(f"Tool call exceeded {max_rounds} rounds, forcing stop")
+        yield sse({}, finish="stop")
+        yield "data: [DONE]\n\n"
+
+    def _respond(self, model: str, created: int, reply_messages: List[Dict[str, Any]], pending_tool_calls=None):
+        """Unified exit: final processing (outbound hook, content extraction,
+        tool-record exposure) then build the chat completion response."""
+        sse_id = f"chatcmpl-{created}"
+        reply_messages = self.manager.run_outbound(self.cfg, list(reply_messages))
+        final_content = self._extract_reply_content(reply_messages)
 
         if pending_tool_calls:
-            # Pass the non-LLMPP tool calls through to the caller (agentic loop).
             last_assistant = next(
                 (m for m in reversed(reply_messages) if m.get("role") == "assistant"),
                 None,
             )
             return jsonify(
                 {
-                    "id": f"chatcmpl-{created}{int(time.time() * 1000) % 10000}",
+                    "id": sse_id,
                     "object": "chat.completion",
                     "created": created,
                     "model": model,
@@ -339,7 +562,7 @@ class LLM_Server:
 
         return jsonify(
             {
-                "id": f"chatcmpl-{created}{int(time.time() * 1000) % 10000}",
+                "id": sse_id,
                 "object": "chat.completion",
                 "created": created,
                 "model": model,
@@ -347,48 +570,13 @@ class LLM_Server:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": content},
+                        "message": {"role": "assistant", "content": final_content},
                         "finish_reason": "stop",
                     }
                 ],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             }
         )
-
-    def _handle_stream(self, model: str, messages: List[Dict[str, Any]]):
-        """Handle a streaming request (tools are resolved internally, text is streamed)."""
-        from flask import Response
-
-        if self.cfg["mode"] == "compatible":
-            # Compatible mode does not stream; fall back to a plain response.
-            content, reply_messages = self._run_compatible(model, messages)
-            reply_messages = self.manager.run_outbound(self.cfg, reply_messages)
-            content = self._extract_reply_content(reply_messages)
-            created = int(time.time())
-            return jsonify(
-                {
-                    "id": f"chatcmpl-{created}",
-                    "object": "chat.completion",
-                    "created": created,
-                    "model": model,
-                    "messages": reply_messages,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": content},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-            )
-
-        return Response(self._run_native_stream(model, messages), mimetype="text/event-stream")
-
-    @staticmethod
-    def _sse(payload: Dict[str, Any]) -> str:
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-    # --- LLM calls ---------------------------------------------------------
 
     def _call(
         self,
@@ -409,55 +597,6 @@ class LLM_Server:
         if stream:
             return resp
         return resp.choices[0].message
-
-    def _run_native(self, model: str, messages: List[Dict[str, Any]], client_tools: Optional[List[Dict[str, Any]]] = None):
-        """Native tool-calling protocol (non-streaming).
-
-        Returns (content, reply_messages, pending_tool_calls):
-          - content: final text (or "" if tool calls were passed through)
-          - reply_messages: client-facing conversation list
-          - pending_tool_calls: list of tool calls owned by the caller to be
-            executed client-side, or None if none
-        """
-        tools = self.manager.tools()
-        if client_tools:
-            tools = list(tools) + list(client_tools)
-        max_rounds = self.cfg["tools"].get("max_rounds", 10)
-        for _ in range(max_rounds):
-            msg = self._call(model, messages, tools=tools)
-            if not msg.tool_calls:
-                content = msg.content or ""
-                messages.append({"role": "assistant", "content": content})
-                reply = [
-                    m
-                    for m in messages
-                    if m.get("role") != "tool" and not m.get("tool_calls")
-                ]
-                return content, reply, None
-            # If any requested tool is not an LLMPP plugin, pass the request
-            # through to the caller (standard agentic loop).
-            foreign = [tc for tc in msg.tool_calls if tc.function.name not in self.manager.plugins]
-            if foreign:
-                tool_calls_msg = {
-                    "role": "assistant",
-                    "content": msg.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in msg.tool_calls
-                    ],
-                }
-                messages.append(tool_calls_msg)
-                return "", messages, [tc for tc in msg.tool_calls]
-            self._apply_tool_calls(messages, msg.tool_calls)
-        log.warning(f"Tool call exceeded {max_rounds} rounds, forcing stop")
-        return "", [m for m in messages if m.get("role") != "tool" and not m.get("tool_calls")], None
 
     def _apply_tool_calls(self, messages: List[Dict[str, Any]], tool_calls) -> None:
         """Record assistant tool_calls and append tool results to messages.
@@ -504,75 +643,6 @@ class LLM_Server:
             messages.append(
                 {"role": "tool", "tool_call_id": tc["id"], "content": result}
             )
-
-    def _run_native_stream(self, model: str, messages: List[Dict[str, Any]]):
-        """Native tool-calling protocol (streaming).
-
-        Single-stream generation: text (delta.content) is forwarded
-        token-by-token, while tool calls (delta.tool_calls) are accumulated.
-        After the stream ends, tools are executed and results fed back, then
-        the loop continues until the model produces a plain text reply.
-        Yields SSE chunk strings.
-        """
-        tools = self.manager.tools()
-        max_rounds = self.cfg["tools"].get("max_rounds", 10)
-        created = int(time.time())
-        sse_id = f"chatcmpl-{created}"
-
-        def sse(delta, finish=None):
-            return self._sse(
-                {
-                    "id": sse_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-                }
-            )
-
-        yield sse({"role": "assistant", "content": ""})
-
-        for _ in range(max_rounds):
-            stream = self._call(model, messages, tools=tools, stream=True)
-            tool_acc = {}  # index -> {name, args, id}
-            saw_text = False
-            for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                if delta is None:
-                    continue
-                if delta.content:
-                    saw_text = True
-                    yield sse({"content": delta.content})
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index if tc.index is not None else 0
-                        slot = tool_acc.setdefault(idx, {"name": "", "args": "", "id": tc.id or ""})
-                        if tc.function:
-                            if tc.function.name:
-                                slot["name"] += tc.function.name
-                            if tc.function.arguments:
-                                slot["args"] += tc.function.arguments
-            if not tool_acc:
-                # No tool calls: this was the final text reply.
-                yield sse({}, finish="stop")
-                yield "data: [DONE]\n\n"
-                return
-            # Tool calls were requested: record, execute (LLMPP tools), feed back.
-            tool_calls = [
-                {
-                    "id": slot["id"],
-                    "type": "function",
-                    "function": {"name": slot["name"], "arguments": slot["args"]},
-                }
-                for idx, slot in sorted(tool_acc.items())
-            ]
-            self._apply_tool_calls(messages, tool_calls)
-
-        log.warning(f"Tool call exceeded {max_rounds} rounds, forcing stop")
-        yield sse({}, finish="stop")
-        yield "data: [DONE]\n\n"
 
     def _compat_schema(self) -> Dict[str, Any]:
         """JSON schema for structured compatible mode: action = tool name or 'reply'."""
@@ -626,57 +696,6 @@ class LLM_Server:
             return c
         return ""
 
-    def _run_compatible_mode1(self, model: str, messages: List[Dict[str, Any]], max_rounds: int):
-        """Structured mode: no prompt injection, force json_schema output.
-
-        Inbound messages are re-encoded as {"role":"user","content":JSON with
-        a type tag} (sys_msg / user_msg), and tool results are returned as
-        {"type":"tool_result","content":...}. Returns (content, reply_messages)
-        on success, or None to trigger fallback to mode 2.
-        """
-        try:
-            response_format = self._compat_schema()
-        except Exception as e:
-            log.warning(f"Compatible mode1: schema build failed: {e}")
-            return None
-        messages = self._encode_mode1(messages)
-        try:
-            for _ in range(max_rounds):
-                msg = self._call(model, messages, response_format=response_format)
-                content = (msg.content or "").strip()
-                parsed = self._parse_compat(content)
-                if parsed is None:
-                    log.warning("Compatible mode1: unparseable output, falling back")
-                    return None
-                action, args = parsed
-                if action == "reply":
-                    text = args.get("text") if isinstance(args, dict) else args
-                    if not text:
-                        log.warning("Compatible mode1: empty reply, falling back")
-                        return None
-                    messages.append({"role": "assistant", "content": str(text)})
-                    return str(text), messages
-                if action not in self.manager.plugins:
-                    log.warning(f"Compatible mode1: unknown action '{action}', falling back")
-                    return None
-                messages.append({"role": "assistant", "content": content})
-                result = self.manager.call(action, args)
-                log.info(f"[tool] {action}({args}) -> {result}")
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {"type": "tool_result", "content": result},
-                            ensure_ascii=False,
-                        ),
-                    }
-                )
-        except Exception as e:
-            log.warning(f"Compatible mode1 failed: {e}, falling back")
-            return None
-        log.warning("Compatible mode1: max rounds exceeded, falling back")
-        return None
-
     @staticmethod
     def _encode_mode1(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Re-encode inbound messages for mode 1: all user role with a type tag.
@@ -705,81 +724,6 @@ class LLM_Server:
             else:
                 out.append(dict(m))
         return out
-
-    def _run_compatible(self, model: str, messages: List[Dict[str, Any]]):
-        """Text-protocol mode for models without tools support.
-
-        Two-tier fallback ladder:
-          mode 1: structured json_schema (no prompt injection)
-          mode 2: prompt injection + fault-tolerant JSON extraction
-        If both fail, return an error.
-
-        Returns (content, reply_messages, pending_tool_calls).
-        """
-        max_rounds = self.cfg["tools"].get("max_rounds", 10)
-
-        r = self._run_compatible_mode1(model, messages, max_rounds)
-        if r is not None:
-            content, reply = r
-            return content, reply, None
-
-        funcs = "\n".join(
-            f"- {name}: {inspect.getdoc(func) or ''}"
-            for name, func in self.manager.plugins.items()
-        )
-        messages = list(messages)
-        messages.insert(
-            0,
-            {
-                "role": "system",
-                "content": self.PROMPT_PROTOCOL_TIPS.format(functions=funcs),
-            },
-        )
-        for _ in range(max_rounds):
-            msg = self._call(model, messages)
-            content = (msg.content or "").strip()
-            parsed = self._parse_compat(content)
-            if parsed is None:
-                if content and not content.startswith("{"):
-                    # Valid plain text: it is the final reply.
-                    messages.append({"role": "assistant", "content": content})
-                    return content, messages[1:], None
-                # Empty or unparseable JSON: give up immediately (no retry).
-                return "[llmpp] compatible mode produced no valid reply", messages[1:], None
-            action, args = parsed
-            if action == "reply":
-                text = args.get("text") if isinstance(args, dict) else args
-                if not text:
-                    return "[llmpp] compatible mode produced no valid reply", messages[1:], None
-                messages.append({"role": "assistant", "content": str(text)})
-                return str(text), messages[1:], None
-            if action not in self.manager.plugins:
-                return "[llmpp] compatible mode produced no valid reply", messages[1:], None
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": content,
-                }
-            )
-            result = self.manager.call(action, args)
-            log.info(f"[tool] {action}({args}) -> {result}")
-            messages.append(
-                {"role": "user", "content": f"tool_result:{result}"}
-            )
-        log.warning(f"Tool call exceeded {max_rounds} rounds, forcing stop")
-        # Fallback: return the last non-empty, non-JSON assistant text if any,
-        # else a clear error so the client never gets a silent/JSON reply.
-        last_text = ""
-        for m in reversed(messages[1:]):
-            if m.get("role") == "assistant" and m.get("content"):
-                c = m["content"].strip()
-                if c.startswith("{"):
-                    continue
-                last_text = c
-                break
-        if last_text:
-            return last_text, messages[1:], None
-        return "[llmpp] compatible mode produced no valid reply", messages[1:], None
 
     @staticmethod
     def _try_parse_json(content: str):
