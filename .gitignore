@@ -7,5 +7,6 @@ build/
 .venv/
 config.json
 mcp_config.json
+plugins.json
 PLAN.md
 plugins/

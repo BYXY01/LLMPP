@@ -30,6 +30,7 @@ Plugin -> PluginManager : plugin part, drop .py files to add tools & hooks
 - **Auth & key passthrough** — optional API keys via the `LLMPP_API_KEYs` env var; caller-provided keys can be passed through to the provider.
 - **Production WSGI** — served by waitress, not the Flask development server.
 - **MCP client** (experimental) — connect external MCP servers (stdio/HTTP) via the standalone `mcp_bridge.py`; their tools join the tool registry.
+- **Plugin management** — an authorized manager function (via `manager_plugin`) can list/enable/disable/reload plugins; state persists in `plugins.json`.
 - **Any LLM backend** — OpenAI, LM Studio, Ollama, vLLM, etc. (any OpenAI-compatible base URL).
 
 ## Quick Start
@@ -83,6 +84,7 @@ python LLMPP.py
 | `mode` | `native` (function calling) or `compatible` (text protocol). |
 | `tools.max_rounds` | Max tool-call rounds per request (safety valve against loops). |
 | `hooks.inbound` / `hooks.outbound` | Name of the inbound/outbound hook plugin to use. |
+| `manager_plugin` | Name of the single authorized manager function (list/enable/disable/reload). |
 
 The model name is **not** configured here — clients pass it in each request, as with the standard OpenAI API.
 
@@ -216,6 +218,32 @@ import os
 from dotenv import load_dotenv
 ```
 
+### Manager plugin
+
+Authorize a **single management function** (by name) in `config.json`:
+
+```json
+"manager_plugin": "manage"
+```
+
+The authorized function receives `manager` (the plugin manager's single
+entry point) as its **first argument**, injected by LLMPP. That argument is
+filtered out of the tool schema the model sees, so the model calls it with
+just `action`/`name`:
+
+```python
+def manage(manager, action, name=None):
+    """List/enable/disable/reload plugins."""
+    return manager(action, name or "")
+
+
+__tools__ = [manage]
+```
+
+Any function — declared via `__tools__` or `__hooks__` — can be the manager
+function; whichever matches `manager_plugin` gets `manager` injected as its
+first argument (and, for tools, hidden from the model's schema).
+
 ## Usage (API)
 
 ```python
@@ -239,7 +267,7 @@ print(resp.choices[0].message.content)
 
 ## Status
 
-Alpha (`v0.0.15`). Core features, auth & key passthrough work; served by waitress (production WSGI); experimental MCP client. Plugin management is planned.
+Alpha (`v0.0.16`). Core features, auth & key passthrough, plugin management, experimental MCP client; served by waitress (production WSGI).
 
 ## License
 

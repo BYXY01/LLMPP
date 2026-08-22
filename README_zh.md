@@ -30,6 +30,7 @@ Plugin -> PluginManager : 插件部分，丢 .py 文件即可添加工具与处�
 - **鉴权与密钥穿透** — 通过 `LLMPP_API_KEYs` 环境变量设置可选鉴权；调用者密钥可穿透给后端供应方。
 - **生产 WSGI** — 由 waitress 托管，非 Flask 开发服务器。
 - **MCP 客户端**（实验）— 通过独立的 `mcp_bridge.py` 连接外部 MCP 服务器（stdio / HTTP），其工具并入工具体系。
+- **插件管理** — 配置授权的管理函数可列出/启用/禁用/重载插件；状态持久化于 `plugins.json`。
 - **任意 LLM 后端** — OpenAI、LM Studio、Ollama、vLLM 等（任何 OpenAI 兼容 base URL）。
 
 ## 快速开始
@@ -83,6 +84,7 @@ python LLMPP.py
 | `mode` | `native`（函数调用）或 `compatible`（文本协议）。 |
 | `tools.max_rounds` | 单次请求内工具调用轮数上限（防死循环安全阀）。 |
 | `hooks.inbound` / `hooks.outbound` | 使用的入站 / 出站处理器插件名。 |
+| `manager_plugin` | 唯一管理授权函数名（列出/启用/禁用/重载）。 |
 
 模型名**不在**这里配置——由客户端在每次请求中传入，与标准 OpenAI API 一致。
 
@@ -215,6 +217,27 @@ import os
 from dotenv import load_dotenv
 ```
 
+### 管理函数
+
+在 `config.json` 中按函数名授权**唯一的管理函数**：
+
+```json
+"manager_plugin": "manage"
+```
+
+被授权函数将 `manager`（插件管理的单一入口）作为**第一个参数**接收，由 LLMPP 注入。该参数会在模型看到的工具 schema 中被过滤，因此模型只需传 `action`/`name`：
+
+```python
+def manage(manager, action, name=None):
+    """列出 / 启用 / 禁用 / 重载插件。"""
+    return manager(action, name or "")
+
+
+__tools__ = [manage]
+```
+
+任何函数——无论是通过 `__tools__` 还是 `__hooks__` 声明——都可作为管理函数；只要名字匹配 `manager_plugin`，其第一个参数就会注入 `manager`（作为工具时该参数对模型 schema 隐藏）。
+
 ## 使用示例（API）
 
 ```python
@@ -238,7 +261,7 @@ print(resp.choices[0].message.content)
 
 ## 状态
 
-Alpha（`v0.0.15`）。核心功能与鉴权/密钥穿透可用；由 waitress（生产 WSGI）托管；实验性 MCP 客户端。插件管理为规划项。
+Alpha（`v0.0.16`）。核心功能、鉴权与密钥穿透、插件管理、实验性 MCP 客户端可用；由 waitress（生产 WSGI）托管。
 
 ## 许可证
 
