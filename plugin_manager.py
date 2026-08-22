@@ -22,12 +22,6 @@ log = logging.getLogger("LLMPP")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-try:
-    from mcp_bridge import MCPClient as _MCPClient
-except ImportError:
-    _MCPClient = None  # type: ignore[assignment,misc]
-
-
 def ensure_deps(deps: List[Tuple[str, str]]):
     """Auto-install missing dependencies before importing them.
 
@@ -69,8 +63,6 @@ class PluginManager:
         self.state_path = os.path.join(BASE_DIR, "plugins.json")
         self.plugin_states: Dict[str, str] = self._read_states()
         self.disabled: set = {n for n, s in self.plugin_states.items() if s == "disabled"}
-        self.mcp_client = _MCPClient() if _MCPClient is not None else None
-        self.mcp_tools: Dict[str, Dict[str, Any]] = {}
         # management queue + lock
         self._mgmt_queue: "queue.Queue[Optional[Tuple[str, str, queue.Queue[Any]]]]" = queue.Queue()  # type: ignore[valid-type]
         self._mgmt_thread: Optional[threading.Thread] = None
@@ -111,14 +103,9 @@ class PluginManager:
         self._mgmt_thread = threading.Thread(target=self._mgmt_loop, name="llmpp-manager", daemon=True)
         self._mgmt_thread.start()
         log.info("PluginManager management thread started")
-        if self.mcp_client:
-            self.mcp_client.start()
-            log.info("MCP client thread started")
 
     def stop(self) -> None:
         """Signal the management thread to exit."""
-        if self.mcp_client:
-            self.mcp_client.stop()
         if self._mgmt_thread is not None and self._mgmt_thread.is_alive():
             self._mgmt_queue.put(None)
             self._mgmt_thread.join(timeout=5)
@@ -230,13 +217,6 @@ class PluginManager:
         log.info(f"Registered hooks: {sorted(self.hooks)}")
         if self.manager_fn is not None:
             log.info(f"Registered manager: {self.manager_fn.__name__}")
-        if self.mcp_client:
-            try:
-                self.mcp_tools = {t["function"]["name"]: t for t in self.mcp_client.load()}
-                if self.mcp_tools:
-                    log.info(f"Loaded MCP tools: {sorted(self.mcp_tools)}")
-            except Exception as e:
-                log.warning(f"MCP tools load failed: {e}")
         self._sync_discovered_states()
 
     def _load_plugin_file(self, module_name: str) -> bool:
@@ -343,22 +323,18 @@ class PluginManager:
         }
 
     def tools(self) -> List[Dict[str, Any]]:
-        """Build the tool list for the OpenAI API (plugins + MCP)."""
-        tools = [
+        """Build the tool list for the OpenAI API (plugins)."""
+        return [
             self._tool_schema(name, func)
             for name, func in self.plugins.items()
         ]
-        tools.extend(self.mcp_tools.values())
-        return tools
 
     def has_tool(self, name: str) -> bool:
-        """True if `name` is a plugin tool or an MCP tool."""
-        return name in self.plugins or name in self.mcp_tools
+        """True if `name` is a plugin tool."""
+        return name in self.plugins
 
     def call(self, name: str, args: Dict[str, Any]) -> str:
-        """Execute a tool (plugin or MCP) and return its result as a string."""
-        if name in self.mcp_tools and self.mcp_client:
-            return self.mcp_client.call(name, args)
+        """Execute a plugin tool and return its result as a string."""
         if name not in self.plugins:
             return f"[error] Function not found: {name}"
         try:
@@ -374,9 +350,7 @@ class PluginManager:
             return f"[error] Function execution failed: {e}"
 
     async def call_async(self, name: str, args: Dict[str, Any]) -> str:
-        """Async tool execution; MCP uses the async client, plugins stay sync."""
-        if name in self.mcp_tools and self.mcp_client:
-            return await self.mcp_client.call_async(name, args)
+        """Async plugin tool execution (plugins are sync; kept for interface parity)."""
         return self.call(name, args)
 
     def run_inbound(self, cfg: Dict[str, Any], messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

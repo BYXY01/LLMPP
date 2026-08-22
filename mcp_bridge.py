@@ -124,6 +124,14 @@ class MCPClient:
                 self._tool_owner[tool_name] = name
         return list(self._tools.values())
 
+    def tools(self) -> List[Dict[str, Any]]:
+        """Return the cached tool schemas."""
+        return list(self._tools.values())
+
+    def has_tool(self, name: str) -> bool:
+        """True if `name` is a known MCP tool."""
+        return name in self._tools
+
     def _run_on_loop(self, coro):
         """Run an async callable on the MCP thread's loop; else a fresh run."""
         if self._loop is not None and self._loop.is_running():

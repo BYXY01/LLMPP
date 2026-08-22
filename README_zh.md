@@ -267,7 +267,7 @@ print(resp.choices[0].message.content)
 
 ## 状态
 
-Alpha（`v0.0.18`）。核心功能、鉴权与密钥穿透、插件管理、实验性 MCP 客户端可用；异步管线 + 线程化架构，双 OpenAI/Anthropic 协议与后端，完整 `/v1/*` 透传。
+**Beta**（`v0.0.19`）。核心功能、鉴权与密钥穿透、插件管理、实验性 MCP 客户端可用；异步管线 + 线程化架构，双 OpenAI/Anthropic 协议与后端，完整 `/v1/*` 透传。自动化测试位于 `tests/`（运行 `pytest tests/`）。
 
 ## 许可证
 

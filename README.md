@@ -273,7 +273,7 @@ print(resp.choices[0].message.content)
 
 ## Status
 
-Alpha (`v0.0.18`). Core features, auth & key passthrough, plugin management, experimental MCP client; async pipeline + threaded architecture, dual OpenAI/Anthropic protocols & backends, full `/v1/*` passthrough.
+**Beta** (`v0.0.19`). Core features, auth & key passthrough, plugin management, experimental MCP client; async pipeline + threaded architecture, dual OpenAI/Anthropic protocols & backends, full `/v1/*` passthrough. Automated tests in `tests/` (run `pytest tests/`).
 
 ## License
 

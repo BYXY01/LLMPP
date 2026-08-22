@@ -50,7 +50,7 @@ ensure_deps([("flask", "flask"), ("waitress", "waitress"), ("openai", "openai")]
 from llm_server import LLM_Server  # noqa: E402
 from plugin_manager import PluginManager  # noqa: E402
 
-VERSION = "0.0.18-alpha"
+VERSION = "0.0.19-beta"
 
 BANNER = r"""   ______         __    __    __  _______  ____ 
   /     /|       / /   / /   /  |/  / __ \/ __ \
@@ -148,8 +148,23 @@ def main():
     manager.load()
     manager.start()
 
+    # MCPClient: optional peer of PluginManager, runs its own thread.
+    mcp = None
+    try:
+        from mcp_bridge import MCPClient
+
+        mcp = MCPClient()
+        if mcp.servers:
+            mcp.load()
+            mcp.start()
+            log.info("MCP client started")
+        else:
+            mcp = None
+    except ImportError:
+        mcp = None
+
     # LLM_Server: serve requests on a dedicated waitress thread.
-    server = LLM_Server(cfg, manager, version=VERSION)
+    server = LLM_Server(cfg, manager, version=VERSION, mcp=mcp)
     print(BANNER, flush=True)
     log.info(f"LLMPP v{VERSION} starting")
     log.info(f"OpenAI-compatible endpoint: http://{host}:{port}/v1/chat/completions")
