@@ -11,8 +11,13 @@
 An out-of-the-box, **OpenAI-compatible** middleware that extends any LLM backend with plugin capabilities.
 
 ```
-LLM  -> LLM_Server  : proxy part, OpenAI in / OpenAI out
-Plugin -> PluginManager : plugin part, drop .py files to add tools & hooks
+Caller (OpenAI / Anthropic)
+    ↓ inbound conversion (unified internal OpenAI)
+LLM_Server (async pipeline, waitress thread)
+    ├─ PluginManager (plugin management thread)
+    └─ MCPClient (optional MCP peer, own thread)
+    ↓ outbound conversion (llm.provider format)
+Backend (OpenAI / LM Studio / Anthropic / ...)
 ```
 
 ## Features
@@ -153,7 +158,7 @@ MCP tool names join the same tool registry as plugins — the model can call the
 
 ## Plugins
 
-Drop `.py` files into `plugins/`. Plugins need **no imports** — just define functions and declare them.
+Drop `.py` files into `plugins/`. Plugins need **no imports** — just define functions and declare them. Ready-made examples live in [`example_plugins/`](example_plugins/).
 
 ### Tools
 
@@ -273,7 +278,7 @@ print(resp.choices[0].message.content)
 
 ## Status
 
-**Beta** (`v0.0.19`). Core features, auth & key passthrough, plugin management, experimental MCP client; async pipeline + threaded architecture, dual OpenAI/Anthropic protocols & backends, full `/v1/*` passthrough. Automated tests in `tests/` (run `pytest tests/`).
+**Stable** (`v0.1.0`). Core features, auth & key passthrough, plugin management, experimental MCP client; async pipeline + threaded architecture, dual OpenAI/Anthropic protocols & backends, full `/v1/*` passthrough. Automated tests in `tests/` (run `pytest tests/`).
 
 ## License
 

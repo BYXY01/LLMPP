@@ -50,7 +50,7 @@ ensure_deps([("flask", "flask"), ("waitress", "waitress"), ("openai", "openai")]
 from llm_server import LLM_Server  # noqa: E402
 from plugin_manager import PluginManager  # noqa: E402
 
-VERSION = "0.0.19-beta"
+VERSION = "0.1.0"
 
 BANNER = r"""   ______         __    __    __  _______  ____ 
   /     /|       / /   / /   /  |/  / __ \/ __ \

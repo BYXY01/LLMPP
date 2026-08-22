@@ -11,8 +11,13 @@
 一个**开箱即用**的 OpenAI 兼容中间件，通过插件系统为任意 LLM 后端扩展能力。
 
 ```
-LLM    -> LLM_Server    : 代理部分，OpenAI 进 / OpenAI 出
-Plugin -> PluginManager : 插件部分，丢 .py 文件即可添加工具与 hooks
+调用者 (OpenAI / Anthropic 格式)
+    ↓ 入站转换（统一为内部 OpenAI）
+LLM_Server (异步管线，waitress 线程)
+    ├─ PluginManager (插件管理线程)
+    └─ MCPClient (可选 MCP 平级组件，独立线程)
+    ↓ 出站转换（按 llm.provider 格式）
+后端 (OpenAI / LM Studio / Anthropic / ...)
 ```
 
 ## 特性
@@ -153,7 +158,7 @@ MCP 工具名与插件工具进入同一工具注册表——模型可像调用�
 
 ## 插件
 
-把 `.py` 文件丢进 `plugins/`。插件**无需任何 import**——只需定义函数并声明。
+把 `.py` 文件丢进 `plugins/`。插件**无需任何 import**——只需定义函数并声明。现成示例见 [`example_plugins/`](example_plugins/)。
 
 ### 工具插件
 
@@ -267,7 +272,7 @@ print(resp.choices[0].message.content)
 
 ## 状态
 
-**Beta**（`v0.0.19`）。核心功能、鉴权与密钥穿透、插件管理、实验性 MCP 客户端可用；异步管线 + 线程化架构，双 OpenAI/Anthropic 协议与后端，完整 `/v1/*` 透传。自动化测试位于 `tests/`（运行 `pytest tests/`）。
+**稳定**（`v0.1.0`）。核心功能、鉴权与密钥穿透、插件管理、实验性 MCP 客户端可用；异步管线 + 线程化架构，双 OpenAI/Anthropic 协议与后端，完整 `/v1/*` 透传。自动化测试位于 `tests/`（运行 `pytest tests/`）。
 
 ## 许可证
 
