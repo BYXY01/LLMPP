@@ -333,13 +333,27 @@ class PluginManager:
         """True if `name` is a plugin tool."""
         return name in self.plugins
 
-    def call(self, name: str, args: Dict[str, Any]) -> str:
-        """Execute a plugin tool and return its result as a string."""
+    def call(self, name: str, args: Dict[str, Any], info: Optional[Dict[str, Any]] = None) -> str:
+        """Execute a plugin tool and return its result as a string.
+
+        If `info` is provided and the plugin function declares an `info`
+        keyword (or **kwargs), it is passed explicitly as `info=info`
+        (overriding any `info` key already in `args`). Otherwise the plugin
+        is called with only its declared arguments.
+        """
         if name not in self.plugins:
             return f"[error] Function not found: {name}"
         try:
             fn = self.plugins[name]
-            result = fn(self.manager, **args) if fn is self.manager_fn else fn(**args)
+            call_args = dict(args)
+            accepts_info = self._accepts_keyword(fn, "info")
+            if info is not None and accepts_info:
+                call_args["info"] = info
+            elif "info" in call_args and not accepts_info:
+                # `info` is an LLMPP-reserved key; drop it if the plugin
+                # doesn't declare it (prevents leaking it as a normal arg).
+                call_args.pop("info")
+            result = fn(self.manager, **call_args) if fn is self.manager_fn else fn(**call_args)
             if result is None:
                 return "[ok] Function executed, no return value"
             if isinstance(result, (dict, list)):
@@ -349,18 +363,25 @@ class PluginManager:
             log.error(f"Tool {name} failed: {e}")
             return f"[error] Function execution failed: {e}"
 
-    async def call_async(self, name: str, args: Dict[str, Any]) -> str:
+    async def call_async(self, name: str, args: Dict[str, Any], info: Optional[Dict[str, Any]] = None) -> str:
         """Async plugin tool execution (plugins are sync; kept for interface parity)."""
-        return self.call(name, args)
+        return self.call(name, args, info=info)
 
-    def run_inbound(self, cfg: Dict[str, Any], messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Run the inbound hook (before messages reach the LLM)."""
+    def run_inbound(self, cfg: Dict[str, Any], messages: List[Dict[str, Any]], info: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Run the inbound hook (before messages reach the LLM).
+
+        If `info` is provided and the hook declares an `info` keyword (or
+        **kwargs), it is passed explicitly; otherwise the hook is called with
+        only its declared arguments.
+        """
         name = cfg["hooks"].get("inbound")
         if name and name in self.hooks:
             try:
                 hook_fn = self.hooks[name]
                 if hook_fn is self.manager_fn:
                     result = hook_fn(self.manager, messages)
+                elif info is not None and self._accepts_keyword(hook_fn, "info"):
+                    result = hook_fn(messages, info=info)
                 else:
                     result = hook_fn(messages)
                 if isinstance(result, list):
@@ -369,7 +390,7 @@ class PluginManager:
                 log.error(f"Inbound hook {name} error: {e}")
         return messages
 
-    def run_outbound(self, cfg: Dict[str, Any], messages: List[Dict[str, Any]], stream_chunk: Optional[str] = None) -> Any:
+    def run_outbound(self, cfg: Dict[str, Any], messages: List[Dict[str, Any]], stream_chunk: Optional[str] = None, info: Optional[Dict[str, Any]] = None) -> Any:
         """Run the outbound hook (after the LLM replies, before returning).
 
         Non-streaming: hook(messages) returns a list -> the new message list.
@@ -378,6 +399,9 @@ class PluginManager:
         -> (processed messages, processed stream chunk). Hooks without a
         stream_chunk parameter raise TypeError, which is caught and logged;
         the original messages are returned unchanged (try/except/continue).
+
+        If `info` is provided and the hook declares an `info` keyword (or
+        **kwargs), it is passed explicitly.
         """
         name = cfg["hooks"].get("outbound")
         if name and name in self.hooks:
@@ -392,6 +416,8 @@ class PluginManager:
                     return r_msg, r_chunk
                 if hook_fn is self.manager_fn:
                     result = hook_fn(self.manager, messages)
+                elif info is not None and self._accepts_keyword(hook_fn, "info"):
+                    result = hook_fn(messages, info=info)
                 else:
                     result = hook_fn(messages)
                 if isinstance(result, list):
@@ -401,6 +427,16 @@ class PluginManager:
                 if stream_chunk:
                     return messages, None
         return messages
+
+    @staticmethod
+    def _accepts_keyword(fn, key: str) -> bool:
+        """True if `fn` declares `key` as a keyword or accepts **kwargs."""
+        import inspect as _inspect
+
+        sig = _inspect.signature(fn)
+        return key in sig.parameters or any(
+            p.kind == _inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
 
 
 class _nullcontext:

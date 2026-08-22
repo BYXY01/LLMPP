@@ -155,10 +155,10 @@ class LLM_Server:
             return True
         return self.mcp is not None and self.mcp.has_tool(name)
 
-    async def _call_tool_async(self, name: str, args: Dict[str, Any]) -> str:
+    async def _call_tool_async(self, name: str, args: Dict[str, Any], info: Optional[Dict[str, Any]] = None) -> str:
         """Dispatch a tool call to its owner (plugin or MCP)."""
         if self.manager.has_tool(name):
-            return await self.manager.call_async(name, args)
+            return await self.manager.call_async(name, args, info=info)
         if self.mcp is not None and self.mcp.has_tool(name):
             return await self.mcp.call_async(name, args)
         return f"[error] Function not found: {name}"
@@ -255,7 +255,7 @@ class LLM_Server:
         `payload` defaults to the Flask request body; Anthropic entry converts
         and passes an OpenAI-format payload here.
         """
-        client_ip = request.remote_addr
+        client_ip = request.remote_addr or ""
         if payload is None:
             payload = request.get_json(force=True)
         assert payload is not None
@@ -268,7 +268,9 @@ class LLM_Server:
         if auth_err:
             return auth_err
 
-        messages = self.manager.run_inbound(self.cfg, list(messages))
+        info = self._build_info(client_ip, payload)
+
+        messages = self.manager.run_inbound(self.cfg, list(messages), info)
         model = payload.get("model")
         if not model:
             return jsonify({"error": {"message": "model must be specified in request", "type": "invalid_request_error"}}), 400
@@ -279,13 +281,38 @@ class LLM_Server:
         if stream:
             if self.cfg["mode"] == "compatible":
                 # Compatible mode does not stream; return plain response directly.
-                return await self._run_pipeline(model, messages, client_tools, backend_key)
+                return await self._run_pipeline(model, messages, client_tools, backend_key, info)
             return Response(
-                self._stream_native(model, messages, client_tools, backend_key),
+                self._stream_native(model, messages, client_tools, backend_key, info),
                 mimetype="text/event-stream",
             )
 
-        return await self._run_pipeline(model, messages, client_tools, backend_key)
+        return await self._run_pipeline(model, messages, client_tools, backend_key, info)
+
+    def _build_info(self, client_ip: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Build the metadata dict exposed to plugins when enable_meta is on."""
+        if not self.cfg["server"].get("enable_meta", False):
+            return None
+        auth_header = request.headers.get("Authorization", "")
+        caller_key = auth_header[7:].strip() if auth_header.startswith("Bearer ") else None
+        if not self._api_keys:
+            auth_status = "disabled"
+        elif caller_key in self._api_keys:
+            auth_status = "auth"
+        elif self._passthrough:
+            auth_status = "passthrough"
+        else:
+            auth_status = "rejected"
+        meta_raw = payload.get("LLMPP_meta")
+        if not isinstance(meta_raw, dict):
+            meta_raw = payload.get("meta")
+        meta: Dict[str, Any] = meta_raw if isinstance(meta_raw, dict) else {}
+        return {
+            "ip": client_ip,
+            "auth_status": auth_status,
+            "source": meta.get("source"),
+            "meta": meta,
+        }
 
     # --- Anthropic inbound (caller side) -----------------------------------
 
@@ -434,7 +461,7 @@ class LLM_Server:
             401,
         )
 
-    async def _run_pipeline(self, model: str, messages: List[Dict[str, Any]], client_tools: Optional[List[Dict[str, Any]]], backend_key: Optional[str] = None):
+    async def _run_pipeline(self, model: str, messages: List[Dict[str, Any]], client_tools: Optional[List[Dict[str, Any]]], backend_key: Optional[str] = None, info: Optional[Dict[str, Any]] = None):
         """Unified async non-streaming pipeline: mode dispatch in one loop.
 
         Native and compatible are branches inside a single message loop.
@@ -470,7 +497,7 @@ class LLM_Server:
                         if not self._has_tool(a1):
                             break
                         m1.append({"role": "assistant", "content": c1})
-                        r1 = await self._call_tool_async(a1, a1_args)
+                        r1 = await self._call_tool_async(a1, a1_args, info)
                         log.info(f"[tool] {a1}({a1_args}) -> {r1}")
                         m1.append(
                             {
@@ -532,7 +559,7 @@ class LLM_Server:
                             pending_tool_calls = None
                             break
                         m2.append({"role": "assistant", "content": c2})
-                        r2 = await self._call_tool_async(a2, a2_args)
+                        r2 = await self._call_tool_async(a2, a2_args, info)
                         log.info(f"[tool] {a2}({a2_args}) -> {r2}")
                         m2.append({"role": "user", "content": f"tool_result:{r2}"})
                     else:
@@ -565,7 +592,7 @@ class LLM_Server:
                             }
                         )
                         break
-                    await self._apply_tool_calls(messages, msg.tool_calls)
+                    await self._apply_tool_calls(messages, msg.tool_calls, info)
         except Exception as e:
             log.error(f"LLM call failed: {e}")
             return jsonify(
@@ -575,13 +602,13 @@ class LLM_Server:
         if self.cfg["mode"] == "native":
             # Native loop mutated `messages`; use it as the reply list.
             reply_messages = messages
-        return self._respond(model, created, reply_messages, pending_tool_calls)
+        return self._respond(model, created, reply_messages, pending_tool_calls, info)
 
     @staticmethod
     def _sse(payload: Dict[str, Any]) -> str:
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-    def _stream_native(self, model: str, messages: List[Dict[str, Any]], client_tools: Optional[List[Dict[str, Any]]], backend_key: Optional[str] = None):
+    def _stream_native(self, model: str, messages: List[Dict[str, Any]], client_tools: Optional[List[Dict[str, Any]]], backend_key: Optional[str] = None, info: Optional[Dict[str, Any]] = None):
         """Streaming native: token-by-token text, accumulate tool calls.
 
         Synchronous generator (Flask Response); each LLM call is awaited on a
@@ -631,7 +658,7 @@ class LLM_Server:
                             if tc.function.arguments:
                                 slot["args"] += tc.function.arguments
             if not tool_acc:
-                messages = self.manager.run_outbound(self.cfg, list(messages))
+                messages = self.manager.run_outbound(self.cfg, list(messages), info=info)
                 yield sse({}, finish="stop")
                 yield "data: [DONE]\n\n"
                 return
@@ -643,17 +670,17 @@ class LLM_Server:
                 }
                 for idx, slot in sorted(tool_acc.items())
             ]
-            self._apply_tool_calls_sync(messages, tool_calls)
+            self._apply_tool_calls_sync(messages, tool_calls, info)
 
         log.warning(f"Tool call exceeded {max_rounds} rounds, forcing stop")
         yield sse({}, finish="stop")
         yield "data: [DONE]\n\n"
 
-    def _respond(self, model: str, created: int, reply_messages: List[Dict[str, Any]], pending_tool_calls=None):
+    def _respond(self, model: str, created: int, reply_messages: List[Dict[str, Any]], pending_tool_calls=None, info: Optional[Dict[str, Any]] = None):
         """Unified exit: final processing (outbound hook, content extraction,
         tool-record exposure) then build the chat completion response."""
         sse_id = f"chatcmpl-{created}"
-        reply_messages = self.manager.run_outbound(self.cfg, list(reply_messages))
+        reply_messages = self.manager.run_outbound(self.cfg, list(reply_messages), info=info)
         final_content = self._extract_reply_content(reply_messages)
 
         if pending_tool_calls:
@@ -873,7 +900,7 @@ class LLM_Server:
                 raise item
             yield item
 
-    async def _apply_tool_calls(self, messages: List[Dict[str, Any]], tool_calls) -> None:
+    async def _apply_tool_calls(self, messages: List[Dict[str, Any]], tool_calls, info: Optional[Dict[str, Any]] = None) -> None:
         """Record assistant tool_calls and append tool results to messages.
 
         Accepts either OpenAI tool-call objects or plain dicts
@@ -910,7 +937,7 @@ class LLM_Server:
                 args = {}
             name = fn.get("name")
             if self._has_tool(name):
-                result = await self._call_tool_async(name, args)
+                result = await self._call_tool_async(name, args, info)
                 log.info(f"[tool] {name}({args}) -> {result}")
             else:
                 result = f"[llmpp] tool '{name}' belongs to the caller; execute it client-side."
@@ -919,9 +946,9 @@ class LLM_Server:
                 {"role": "tool", "tool_call_id": tc["id"], "content": result}
             )
 
-    def _apply_tool_calls_sync(self, messages: List[Dict[str, Any]], tool_calls) -> None:
+    def _apply_tool_calls_sync(self, messages: List[Dict[str, Any]], tool_calls, info: Optional[Dict[str, Any]] = None) -> None:
         """Synchronous wrapper around `_apply_tool_calls` for streaming."""
-        asyncio.run(self._apply_tool_calls(messages, tool_calls))
+        asyncio.run(self._apply_tool_calls(messages, tool_calls, info))
 
     def _compat_schema(self) -> Dict[str, Any]:
         """JSON schema for structured compatible mode: action = tool name or 'reply'."""

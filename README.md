@@ -156,6 +156,31 @@ python mcp_bridge.py
 
 MCP tool names join the same tool registry as plugins — the model can call them exactly like plugin tools.
 
+## Request metadata (info)
+
+Set `server.enable_meta` to expose request metadata (IP, auth status, source, `meta`) to plugins and hooks that declare an `info` keyword argument:
+
+```json
+"server": {"enable_meta": true}
+```
+
+Clients may attach a note via the request-level `LLMPP_meta` field (falls back to `meta`):
+
+```json
+{"model": "...", "messages": [...], "LLMPP_meta": {"source": "my-client", "note": "..."}}
+```
+
+A tool or hook can accept it optionally — plugins without an `info` parameter are unaffected:
+
+```python
+def get_weather(city: str, info=None) -> str:
+    if info:
+        print("caller ip:", info["ip"], "auth:", info["auth_status"])
+    ...
+```
+
+`info` contains: `ip`, `auth_status` (`disabled`/`auth`/`passthrough`/`rejected`), `source` (from request `LLMPP_meta.source`), and `meta` (the request `LLMPP_meta` object). This is unified across all plugins and hooks (not per-plugin).
+
 ## Plugins
 
 Drop `.py` files into `plugins/`. Plugins need **no imports** — just define functions and declare them. Ready-made examples live in [`example_plugins/`](example_plugins/).
@@ -278,7 +303,7 @@ print(resp.choices[0].message.content)
 
 ## Status
 
-**Stable** (`v0.1.0`). Core features, auth & key passthrough, plugin management, experimental MCP client; async pipeline + threaded architecture, dual OpenAI/Anthropic protocols & backends, full `/v1/*` passthrough. Automated tests in `tests/` (run `pytest tests/`).
+**Stable** (`v0.1.1`). Core features, auth & key passthrough, plugin management, experimental MCP client, request metadata (`info`); async pipeline + threaded architecture, dual OpenAI/Anthropic protocols & backends, full `/v1/*` passthrough. Automated tests in `tests/` (run `pytest tests/`).
 
 ## License
 

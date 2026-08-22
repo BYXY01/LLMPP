@@ -156,6 +156,31 @@ python mcp_bridge.py
 
 MCP 工具名与插件工具进入同一工具注册表——模型可像调用插件工具一样调用它们。
 
+## 请求元数据（info）
+
+设置 `server.enable_meta` 可将请求元数据（IP、鉴权状态、来源、`meta`）开放给声明了 `info` 关键字参数的插件与 hooks：
+
+```json
+"server": {"enable_meta": true}
+```
+
+客户端可通过请求级 `LLMPP_meta` 字段附带备注（回退到 `meta`）：
+
+```json
+{"model": "...", "messages": [...], "LLMPP_meta": {"source": "my-client", "note": "..."}}
+```
+
+工具或 hook 可选接受它——未声明 `info` 参数的插件不受影响：
+
+```python
+def get_weather(city: str, info=None) -> str:
+    if info:
+        print("调用方 IP:", info["ip"], "鉴权:", info["auth_status"])
+    ...
+```
+
+`info` 包含：`ip`、`auth_status`（`disabled`/`auth`/`passthrough`/`rejected`）、`source`（来自请求 `LLMPP_meta.source`）、以及 `meta`（请求 `LLMPP_meta` 对象）。对所有插件与 hooks 统一开放（非逐个可选）。
+
 ## 插件
 
 把 `.py` 文件丢进 `plugins/`。插件**无需任何 import**——只需定义函数并声明。现成示例见 [`example_plugins/`](example_plugins/)。
@@ -272,7 +297,7 @@ print(resp.choices[0].message.content)
 
 ## 状态
 
-**稳定**（`v0.1.0`）。核心功能、鉴权与密钥穿透、插件管理、实验性 MCP 客户端可用；异步管线 + 线程化架构，双 OpenAI/Anthropic 协议与后端，完整 `/v1/*` 透传。自动化测试位于 `tests/`（运行 `pytest tests/`）。
+**稳定**（`v0.1.1`）。核心功能、鉴权与密钥穿透、插件管理、实验性 MCP 客户端、请求元数据（`info`）可用；异步管线 + 线程化架构，双 OpenAI/Anthropic 协议与后端，完整 `/v1/*` 透传。自动化测试位于 `tests/`（运行 `pytest tests/`）。
 
 ## 许可证
 

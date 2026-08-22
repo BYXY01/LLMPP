@@ -50,7 +50,7 @@ ensure_deps([("flask", "flask"), ("waitress", "waitress"), ("openai", "openai")]
 from llm_server import LLM_Server  # noqa: E402
 from plugin_manager import PluginManager  # noqa: E402
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 BANNER = r"""   ______         __    __    __  _______  ____ 
   /     /|       / /   / /   /  |/  / __ \/ __ \
@@ -78,6 +78,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # passthrough: caller keys that miss the list go to the provider as-is.
         # Fallback when empty: LLMPP_API_KEYs env var (comma-separated).
         "api_keys": [],
+        # Expose request metadata (IP / auth status / source / meta) to
+        # plugins that accept an `info` keyword argument.
+        "enable_meta": False,
     },
     "llm": {
         "api_base": "http://127.0.0.1:11434/v1",

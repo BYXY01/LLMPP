@@ -95,6 +95,89 @@ def test_disable_persists_across_reload(plugin_dir, tmp_path, monkeypatch):
     assert "get_time" not in mgr2.plugins
 
 
+def test_call_with_info(manager):
+    def with_info(text, info=None):
+        return f"text={text} info={info}"
+    def without_info(text):
+        return f"text={text}"
+    manager.plugins["with_info"] = with_info
+    manager.plugins["without_info"] = without_info
+
+    info = {"ip": "1.2.3.4", "auth_status": "auth"}
+    # plugin declares info -> injected
+    r = manager.call("with_info", {"text": "hi"}, info=info)
+    assert "info={'ip': '1.2.3.4'" in r
+    # plugin without info -> not injected, works normally
+    assert manager.call("without_info", {"text": "hi"}, info=info) == "text=hi"
+    # args containing an `info` key is not leaked to a plugin without info
+    assert manager.call("without_info", {"text": "hi", "info": "junk"}, info=info) == "text=hi"
+
+
+def test_call_info_overrides_args(manager):
+    def with_info(text, info=None):
+        return f"text={text} info={info}"
+    manager.plugins["with_info"] = with_info
+    r = manager.call("with_info", {"text": "hi", "info": "junk"}, info={"ip": "real"})
+    assert "info={'ip': 'real'}" in r
+
+
+def test_hooks_with_info():
+    seen = {}
+
+    def inbound(messages, info=None):
+        seen["inbound_info"] = info
+        return messages
+
+    def outbound(messages, info=None):
+        seen["outbound_info"] = info
+        return messages
+
+    mgr = PluginManager()
+    mgr.hooks["inbound"] = inbound
+    mgr.hooks["outbound"] = outbound
+    cfg = {"hooks": {"inbound": "inbound", "outbound": "outbound"}}
+    info = {"ip": "9.9.9.9", "auth_status": "auth"}
+
+    msgs = [{"role": "user", "content": "hi"}]
+    mgr.run_inbound(cfg, msgs, info=info)
+    mgr.run_outbound(cfg, msgs, info=info)
+    assert seen["inbound_info"] == info
+    assert seen["outbound_info"] == info
+
+
+def test_hook_without_info_still_works():
+    def inbound(messages):
+        return messages
+
+    mgr = PluginManager()
+    mgr.hooks["inbound"] = inbound
+    cfg = {"hooks": {"inbound": "inbound", "outbound": ""}}
+    msgs = [{"role": "user", "content": "hi"}]
+    out = mgr.run_inbound(cfg, msgs, info={"ip": "x"})
+    assert out == msgs
+
+
+def test_hot_enable(plugin_dir, tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "BASE_DIR", str(tmp_path))
+    mgr = PluginManager(plugins_dir=plugin_dir)
+    mgr.load()
+    assert "get_time" in mgr.plugins
+    mgr.manager("disable", "example_time")
+    assert "get_time" not in mgr.plugins
+    mgr.manager("enable", "example_time")
+    assert "get_time" in mgr.plugins
+
+
+def test_reload(plugin_dir, tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "BASE_DIR", str(tmp_path))
+    mgr = PluginManager(plugins_dir=plugin_dir)
+    mgr.load()
+    assert "get_time" in mgr.plugins
+    r = mgr.manager("reload", "example_time")
+    assert "reloaded" in r
+    assert "get_time" in mgr.plugins
+
+
 def test_manager_plugin_schema_filters_first_arg(manager):
     """The authorized manager function exposes action/name, not `manager`."""
     tools = manager.tools()
