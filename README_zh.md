@@ -19,6 +19,7 @@ Plugin -> PluginManager : 插件部分，丢 .py 文件即可添加工具与处�
 - **插件依赖** — 插件可声明 `__deps__`，LLMPP 自动安装。
 - **流式输出**（实验）— native 模式支持 SSE 流式（逐 token），由 `server.stream` 开关控制。
 - **调用者工具** — 合并客户端提供的 `tools`；调用者自有工具回传给客户端执行（标准 agentic 循环）。
+- **鉴权与密钥穿透** — 通过 `LLMPP_API_KEYs` 环境变量设置可选鉴权；调用者密钥可穿透给后端供应方。
 - **任意 LLM 后端** — OpenAI、LM Studio、Ollama、vLLM 等（任何 OpenAI 兼容 base URL）。
 
 ## 快速开始
@@ -44,7 +45,8 @@ python LLMPP.py
     "server": {
         "host": "127.0.0.1",
         "port": 55677,
-        "stream": false
+        "stream": false,
+        "api_keys": []
     },
     "llm": {
         "api_base": "http://127.0.0.1:11434/v1",
@@ -66,12 +68,41 @@ python LLMPP.py
 |------|------|
 | `server.host` / `server.port` | 监听地址与端口。`port` 必填。 |
 | `server.stream` | 启用 SSE 流式（实验，仅 native 模式）。 |
+| `server.api_keys` | LLMPP 鉴权 key（最多 5 个）；可含 `_PASSTHROUGH_API_KEY`。见"鉴权与密钥穿透"。 |
 | `llm.api_base` / `api_key` | 你的 OpenAI 兼容后端（LM Studio、Ollama、vLLM 等）。 |
 | `mode` | `native`（函数调用）或 `compatible`（文本协议）。 |
 | `tools.max_rounds` | 单次请求内工具调用轮数上限（防死循环安全阀）。 |
 | `hooks.inbound` / `hooks.outbound` | 使用的入站 / 出站处理器插件名。 |
 
 模型名**不在**这里配置——由客户端在每次请求中传入，与标准 OpenAI API 一致。
+
+## 鉴权与密钥穿透
+
+通过 `config.json` 的 `server.api_keys` 列表（**最多 5 个 key**）或环境变量 `LLMPP_API_KEYs`（逗号分隔，config 列表为空时回退）配置：
+
+```json
+"server": {
+    "api_keys": ["my-key-1", "my-key-2"]
+}
+```
+
+```bash
+LLMPP_API_KEYs="my-key-1,my-key-2" python LLMPP.py
+```
+
+- **未设置 / 为空** — LLMPP 鉴权关闭；请求始终用 `llm.api_key` 调用供应方。
+- **严格模式**（无哨兵标记）— 客户端必须带 `Authorization: Bearer <其中一个key>`。命中则用 `llm.api_key` 调用供应方；未命中返回 **401**。
+- **穿透模式** — 在列表中加上哨兵 `_PASSTHROUGH_API_KEY`。命中 LLMPP key 的调用者密钥被改写为 `llm.api_key`；未命中的密钥**原样透传**给供应方（调用者可用自己的供应方密钥）。无 key 请求按空 key 透传。
+
+```json
+"server": {
+    "api_keys": ["my-key-1", "_PASSTHROUGH_API_KEY"]
+}
+```
+
+```bash
+LLMPP_API_KEYs="my-key-1,_PASSTHROUGH_API_KEY" python LLMPP.py
+```
 
 ## 插件
 
@@ -168,4 +199,4 @@ print(resp.choices[0].message.content)
 
 ## 状态
 
-Alpha（`v0.0.12`）。核心功能可用；请求鉴权、插件管理为规划项。
+Alpha（`v0.0.13`）。核心功能与鉴权/密钥穿透可用；插件管理为规划项。

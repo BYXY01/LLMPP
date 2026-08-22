@@ -47,7 +47,7 @@ log = logging.getLogger("LLMPP")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-VERSION = "0.0.12-alpha"
+VERSION = "0.0.13-alpha"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "server": {
@@ -55,6 +55,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # "host": "0.0.0.0",  # expose to network
         # "port": 55677,  # required: LLMPP phone-keypad encoding, uncomment and set
         "stream": False,
+        # Empty list = LLMPP auth disabled, always call provider with llm.api_key.
+        # Up to 5 keys. Include the sentinel "_PASSTHROUGH_API_KEY" to enable
+        # passthrough: caller keys that miss the list go to the provider as-is.
+        # Fallback when empty: LLMPP_API_KEYs env var (comma-separated).
+        "api_keys": [],
     },
     "llm": {
         "api_base": "http://127.0.0.1:11434/v1",
@@ -259,12 +264,29 @@ class LLM_Server:
     def __init__(self, cfg: Dict[str, Any], manager: PluginManager):
         self.cfg = cfg
         self.manager = manager
-        llm = cfg["llm"]
+        self.llm_cfg = cfg["llm"]
         self.client = OpenAI(
-            base_url=llm["api_base"],
-            api_key=llm.get("api_key", "not-needed"),
-            timeout=llm.get("timeout", 120),
+            base_url=self.llm_cfg["api_base"],
+            api_key=self.llm_cfg.get("api_key", "not-needed"),
+            timeout=self.llm_cfg.get("timeout", 120),
         )
+        # Auth keys: server.api_keys first, env LLMPP_API_KEYs as fallback
+        # (comma-separated). Max 5.
+        # Unset -> LLMPP auth disabled, always uses llm.api_key.
+        # Contain sentinel "_PASSTHROUGH_API_KEY" -> passthrough enabled:
+        #   caller key hit an LLMPP key  -> rewritten to llm.api_key
+        #   caller key not in list       -> passed through to provider as-is
+        #   caller sent no key           -> empty-key passthrough
+        # Without sentinel -> strict auth: hit -> llm.api_key; miss -> 401.
+        raw = list(cfg.get("server", {}).get("api_keys", []) or [])
+        if not raw:
+            env = os.environ.get("LLMPP_API_KEYs", "").strip()
+            raw = [k.strip() for k in env.split(",") if k.strip()]
+        if len(raw) > 5:
+            log.warning("auth has more than 5 keys; keeping the first 5")
+            raw = raw[:5]
+        self._passthrough = "_PASSTHROUGH_API_KEY" in raw
+        self._api_keys = {k for k in raw if k != "_PASSTHROUGH_API_KEY"}
         self.app = Flask(__name__)
         self._routes()
 
@@ -300,6 +322,10 @@ class LLM_Server:
         if not isinstance(messages, list):
             return jsonify({"error": {"message": "messages must be an array", "type": "invalid_request_error"}}), 400
 
+        backend_key, auth_err = self._resolve_backend_key()
+        if auth_err:
+            return auth_err
+
         messages = self.manager.run_inbound(self.cfg, list(messages))
         model = payload.get("model")
         if not model:
@@ -311,14 +337,40 @@ class LLM_Server:
         if stream:
             if self.cfg["mode"] == "compatible":
                 # Compatible mode does not stream; return plain response directly.
-                return self._run_pipeline(model, messages, client_tools)
+                return self._run_pipeline(model, messages, client_tools, backend_key)
             from flask import Response
 
-            return Response(self._stream_native(model, messages, client_tools), mimetype="text/event-stream")
+            return Response(self._stream_native(model, messages, client_tools, backend_key), mimetype="text/event-stream")
 
-        return self._run_pipeline(model, messages, client_tools)
+        return self._run_pipeline(model, messages, client_tools, backend_key)
 
-    def _run_pipeline(self, model: str, messages: List[Dict[str, Any]], client_tools: Optional[List[Dict[str, Any]]]):
+    def _resolve_backend_key(self) -> Tuple[Optional[str], Optional[Any]]:
+        """Resolve the backend API key from the request's Authorization header.
+
+        No LLMPP_API_KEYs configured -> auth disabled, use llm.api_key.
+        Hit an LLMPP key              -> rewrite to llm.api_key.
+        Miss + passthrough enabled    -> pass the caller's key through.
+        Miss + no passthrough         -> 401.
+        No key + passthrough enabled  -> empty-key passthrough.
+        """
+        auth_header = request.headers.get("Authorization", "")
+        caller_key = None
+        if auth_header.startswith("Bearer "):
+            caller_key = auth_header[7:].strip() or None
+        if not self._api_keys:
+            return None, None
+        if caller_key is not None and caller_key in self._api_keys:
+            return self.llm_cfg.get("api_key", "not-needed"), None
+        if self._passthrough:
+            return caller_key, None
+        return None, (
+            jsonify(
+                {"error": {"message": "Invalid API key", "type": "invalid_request_error"}}
+            ),
+            401,
+        )
+
+    def _run_pipeline(self, model: str, messages: List[Dict[str, Any]], client_tools: Optional[List[Dict[str, Any]]], backend_key: Optional[str] = None):
         """Unified non-streaming pipeline: mode dispatch in one loop.
 
         Native and compatible are branches inside a single message loop.
@@ -338,7 +390,7 @@ class LLM_Server:
                     response_format = self._compat_schema()
                     m1 = self._encode_mode1(list(messages))
                     for _ in range(max_rounds):
-                        msg1 = self._call(model, m1, response_format=response_format)
+                        msg1 = self._call(model, m1, response_format=response_format, api_key=backend_key)
                         c1 = (msg1.content or "").strip()
                         p1 = self._parse_compat(c1)
                         if p1 is None:
@@ -382,7 +434,7 @@ class LLM_Server:
                         },
                     )
                     for _ in range(max_rounds):
-                        msg2 = self._call(model, m2)
+                        msg2 = self._call(model, m2, api_key=backend_key)
                         c2 = (msg2.content or "").strip()
                         p2 = self._parse_compat(c2)
                         if p2 is None:
@@ -421,7 +473,7 @@ class LLM_Server:
                 if client_tools:
                     tools = list(tools) + list(client_tools)
                 for _ in range(max_rounds):
-                    msg = self._call(model, messages, tools=tools)
+                    msg = self._call(model, messages, tools=tools, api_key=backend_key)
                     if not msg.tool_calls:
                         final_content = msg.content or ""
                         messages.append({"role": "assistant", "content": final_content})
@@ -462,7 +514,7 @@ class LLM_Server:
 
     # --- LLM calls ---------------------------------------------------------
 
-    def _stream_native(self, model: str, messages: List[Dict[str, Any]], client_tools: Optional[List[Dict[str, Any]]]):
+    def _stream_native(self, model: str, messages: List[Dict[str, Any]], client_tools: Optional[List[Dict[str, Any]]], backend_key: Optional[str] = None):
         """Streaming native: token-by-token text, accumulate tool calls.
 
         Yields SSE strings. Tool calls are executed and fed back until the
@@ -490,7 +542,7 @@ class LLM_Server:
 
         for _ in range(max_rounds):
             tool_acc: Dict[int, Dict[str, str]] = {}
-            gen = self._call(model, messages, tools=tools, stream=True)
+            gen = self._call(model, messages, tools=tools, stream=True, api_key=backend_key)
             for chunk in gen:
                 if not chunk.choices:
                     continue
@@ -585,6 +637,7 @@ class LLM_Server:
         tools: Optional[List[Dict[str, Any]]] = None,
         stream: bool = False,
         response_format: Optional[Dict[str, Any]] = None,
+        api_key: Optional[str] = None,
     ) -> Any:
         kwargs: Dict[str, Any] = {"model": model, "messages": messages}
         if tools:
@@ -593,7 +646,14 @@ class LLM_Server:
             kwargs["stream"] = True
         if response_format:
             kwargs["response_format"] = response_format
-        resp = self.client.chat.completions.create(**kwargs)
+        client = self.client
+        if api_key is not None and api_key != self.llm_cfg.get("api_key", "not-needed"):
+            client = OpenAI(
+                base_url=self.llm_cfg["api_base"],
+                api_key=api_key,
+                timeout=self.llm_cfg.get("timeout", 120),
+            )
+        resp = client.chat.completions.create(**kwargs)
         if stream:
             return resp
         return resp.choices[0].message

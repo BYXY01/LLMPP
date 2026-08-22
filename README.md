@@ -19,6 +19,7 @@ Plugin -> PluginManager : plugin part, drop .py files to add tools & hooks
 - **Plugin deps** — a plugin can declare `__deps__` and LLMPP auto-installs them.
 - **Streaming** (experimental) — native mode supports SSE streaming (token-by-token), gated by `server.stream`.
 - **Caller tools** — client-provided `tools` are merged; caller-owned tools are passed back to the client to execute (standard agentic loop).
+- **Auth & key passthrough** — optional API keys via the `LLMPP_API_KEYs` env var; caller-provided keys can be passed through to the provider.
 - **Any LLM backend** — OpenAI, LM Studio, Ollama, vLLM, etc. (any OpenAI-compatible base URL).
 
 ## Quick Start
@@ -44,7 +45,8 @@ python LLMPP.py
     "server": {
         "host": "127.0.0.1",
         "port": 55677,
-        "stream": false
+        "stream": false,
+        "api_keys": []
     },
     "llm": {
         "api_base": "http://127.0.0.1:11434/v1",
@@ -66,12 +68,41 @@ python LLMPP.py
 |-------|-------------|
 | `server.host` / `server.port` | Bind address and port. `port` is required. |
 | `server.stream` | Enable SSE streaming (experimental, native mode only). |
+| `server.api_keys` | LLMPP auth keys (max 5); may include `_PASSTHROUGH_API_KEY`. See "Auth & key passthrough". |
 | `llm.api_base` / `api_key` | Your OpenAI-compatible backend (LM Studio, Ollama, vLLM, ...). |
 | `mode` | `native` (function calling) or `compatible` (text protocol). |
 | `tools.max_rounds` | Max tool-call rounds per request (safety valve against loops). |
 | `hooks.inbound` / `hooks.outbound` | Name of the inbound/outbound hook plugin to use. |
 
 The model name is **not** configured here — clients pass it in each request, as with the standard OpenAI API.
+
+## Auth & key passthrough
+
+Configure API keys (up to **5**) via the `server.api_keys` list in `config.json`, or the `LLMPP_API_KEYs` environment variable (comma-separated) as a fallback when the config list is empty:
+
+```json
+"server": {
+    "api_keys": ["my-key-1", "my-key-2"]
+}
+```
+
+```bash
+LLMPP_API_KEYs="my-key-1,my-key-2" python LLMPP.py
+```
+
+- **Unset / empty** — LLMPP auth is disabled; requests always call the provider with `llm.api_key`.
+- **Strict mode** (no sentinel) — clients must send `Authorization: Bearer <one-of-the-keys>`. A hit calls the provider with `llm.api_key`; a miss returns **401**.
+- **Passthrough mode** — include the sentinel `_PASSTHROUGH_API_KEY` in the list. A caller key that hits an LLMPP key is rewritten to `llm.api_key`; a key that doesn't is **passed through to the provider as-is** (so callers can use their own provider keys). Requests without a key get an empty-key passthrough.
+
+```json
+"server": {
+    "api_keys": ["my-key-1", "_PASSTHROUGH_API_KEY"]
+}
+```
+
+```bash
+LLMPP_API_KEYs="my-key-1,_PASSTHROUGH_API_KEY" python LLMPP.py
+```
 
 ## Plugins
 
@@ -169,4 +200,4 @@ print(resp.choices[0].message.content)
 
 ## Status
 
-Alpha (`v0.0.12`). Core features work; request auth and plugin management are planned.
+Alpha (`v0.0.13`). Core features, auth & key passthrough work; plugin management is planned.
