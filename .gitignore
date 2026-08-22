@@ -6,5 +6,6 @@ dist/
 build/
 .venv/
 config.json
+mcp_config.json
 PLAN.md
 plugins/

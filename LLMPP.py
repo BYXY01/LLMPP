@@ -45,6 +45,11 @@ from flask import Flask, jsonify, request
 from waitress import serve
 from openai import OpenAI
 
+try:
+    from mcp_bridge import MCPClient as _MCPClient
+except ImportError:
+    _MCPClient = None  # type: ignore[assignment,misc]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -53,7 +58,7 @@ log = logging.getLogger("LLMPP")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-VERSION = "0.0.14-alpha"
+VERSION = "0.0.15-alpha"
 
 BANNER = r"""   ______         __    __    __  _______  ____ 
   /     /|       / /   / /   /  |/  / __ \/ __ \
@@ -104,6 +109,8 @@ class PluginManager:
         self.plugins_dir = os.path.abspath(plugins_dir)
         self.plugins: Dict[str, Callable] = {}
         self.hooks: Dict[str, Callable] = {}
+        self.mcp_client = _MCPClient() if _MCPClient is not None else None
+        self.mcp_tools: Dict[str, Dict[str, Any]] = {}
 
     def load(self) -> None:
         """Scan and load all .py files in the plugins directory."""
@@ -142,6 +149,13 @@ class PluginManager:
 
         log.info(f"Loaded plugins: {sorted(self.plugins)}")
         log.info(f"Registered hooks: {sorted(self.hooks)}")
+        if self.mcp_client:
+            try:
+                self.mcp_tools = {t["function"]["name"]: t for t in self.mcp_client.load()}
+                if self.mcp_tools:
+                    log.info(f"Loaded MCP tools: {sorted(self.mcp_tools)}")
+            except Exception as e:
+                log.warning(f"MCP tools load failed: {e}")
 
     def _collect(self, module) -> None:
         """Collect tools/hooks declared via __tools__ / __hooks__ in a plugin module."""
@@ -188,14 +202,22 @@ class PluginManager:
         }
 
     def tools(self) -> List[Dict[str, Any]]:
-        """Build the tool list for the OpenAI API."""
-        return [
+        """Build the tool list for the OpenAI API (plugins + MCP)."""
+        tools = [
             self._tool_schema(name, func)
             for name, func in self.plugins.items()
         ]
+        tools.extend(self.mcp_tools.values())
+        return tools
+
+    def has_tool(self, name: str) -> bool:
+        """True if `name` is a plugin tool or an MCP tool."""
+        return name in self.plugins or name in self.mcp_tools
 
     def call(self, name: str, args: Dict[str, Any]) -> str:
-        """Execute a plugin tool and return its result as a string."""
+        """Execute a tool (plugin or MCP) and return its result as a string."""
+        if name in self.mcp_tools and self.mcp_client:
+            return self.mcp_client.call(name, args)
         if name not in self.plugins:
             return f"[error] Function not found: {name}"
         try:
@@ -415,7 +437,7 @@ class LLM_Server:
                             m1.append({"role": "assistant", "content": str(t1)})
                             final_content, reply_messages, pending_tool_calls = str(t1), m1, None
                             break
-                        if a1 not in self.manager.plugins:
+                        if not self.manager.has_tool(a1):
                             break
                         m1.append({"role": "assistant", "content": c1})
                         r1 = self.manager.call(a1, a1_args)
@@ -433,10 +455,15 @@ class LLM_Server:
 
                 # Mode 2 (fallback): prompt injection + fault-tolerant parse.
                 if not final_content:
-                    funcs = "\n".join(
+                    lines = [
                         f"- {name}: {inspect.getdoc(func) or ''}"
                         for name, func in self.manager.plugins.items()
+                    ]
+                    lines.extend(
+                        f"- {name}: {t['function'].get('description', '')}"
+                        for name, t in self.manager.mcp_tools.items()
                     )
+                    funcs = "\n".join(lines)
                     m2 = list(messages)
                     m2.insert(
                         0,
@@ -469,7 +496,7 @@ class LLM_Server:
                             m2.append({"role": "assistant", "content": str(t2)})
                             final_content, reply_messages, pending_tool_calls = str(t2), m2[1:], None
                             break
-                        if a2 not in self.manager.plugins:
+                        if not self.manager.has_tool(a2):
                             final_content = "[llmpp] compatible mode produced no valid reply"
                             reply_messages = m2[1:]
                             pending_tool_calls = None
@@ -490,7 +517,7 @@ class LLM_Server:
                         final_content = msg.content or ""
                         messages.append({"role": "assistant", "content": final_content})
                         break
-                    foreign = [tc for tc in msg.tool_calls if tc.function.name not in self.manager.plugins]
+                    foreign = [tc for tc in msg.tool_calls if not self.manager.has_tool(tc.function.name)]
                     if foreign:
                         pending_tool_calls = list(msg.tool_calls)
                         messages.append(
@@ -706,7 +733,7 @@ class LLM_Server:
             except json.JSONDecodeError:
                 args = {}
             name = fn.get("name")
-            if name in self.manager.plugins:
+            if self.manager.has_tool(name):
                 result = self.manager.call(name, args)
                 log.info(f"[tool] {name}({args}) -> {result}")
             else:
@@ -718,7 +745,7 @@ class LLM_Server:
 
     def _compat_schema(self) -> Dict[str, Any]:
         """JSON schema for structured compatible mode: action = tool name or 'reply'."""
-        actions = list(self.manager.plugins.keys()) + ["reply"]
+        actions = list(self.manager.plugins.keys()) + list(self.manager.mcp_tools.keys()) + ["reply"]
         return {
             "type": "json_schema",
             "json_schema": {

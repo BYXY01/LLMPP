@@ -29,6 +29,7 @@ Plugin -> PluginManager : 插件部分，丢 .py 文件即可添加工具与处�
 - **调用者工具** — 合并客户端提供的 `tools`；调用者自有工具回传给客户端执行（标准 agentic 循环）。
 - **鉴权与密钥穿透** — 通过 `LLMPP_API_KEYs` 环境变量设置可选鉴权；调用者密钥可穿透给后端供应方。
 - **生产 WSGI** — 由 waitress 托管，非 Flask 开发服务器。
+- **MCP 客户端**（实验）— 通过独立的 `mcp_bridge.py` 连接外部 MCP 服务器（stdio / HTTP），其工具并入工具体系。
 - **任意 LLM 后端** — OpenAI、LM Studio、Ollama、vLLM 等（任何 OpenAI 兼容 base URL）。
 
 ## 快速开始
@@ -112,6 +113,35 @@ LLMPP_API_KEYs="my-key-1,my-key-2" python LLMPP.py
 ```bash
 LLMPP_API_KEYs="my-key-1,_PASSTHROUGH_API_KEY" python LLMPP.py
 ```
+
+## MCP 客户端（实验）
+
+LLMPP 可连接外部 **MCP 服务器**（stdio 或 streamable HTTP），其工具与插件工具一同使用。此功能为**实验性质**且完全可选——若 `mcp` 包（或 `mcp_bridge.py`）缺失，LLMPP 照常运行不启用 MCP。
+
+MCP 服务器在**独立**的 `mcp_config.json`（同目录，不在 `config.json`）中配置：
+
+```json
+{
+    "servers": [
+        {"name": "math", "command": ["python", "/path/to/mcp_server.py"]},
+        {"name": "remote", "url": "http://127.0.0.1:8000/mcp"}
+    ]
+}
+```
+
+`command` 条目走 stdio 传输；`url` 条目走 HTTP。安装 SDK 以启用：
+
+```bash
+python -m pip install mcp
+```
+
+独立列出已连接的工具：
+
+```bash
+python mcp_bridge.py
+```
+
+MCP 工具名与插件工具进入同一工具注册表——模型可像调用插件工具一样调用它们。
 
 ## 插件
 
@@ -208,7 +238,7 @@ print(resp.choices[0].message.content)
 
 ## 状态
 
-Alpha（`v0.0.14`）。核心功能与鉴权/密钥穿透可用；由 waitress（生产 WSGI）托管而非 Flask 开发服务器。插件管理为规划项。
+Alpha（`v0.0.15`）。核心功能与鉴权/密钥穿透可用；由 waitress（生产 WSGI）托管；实验性 MCP 客户端。插件管理为规划项。
 
 ## 许可证
 

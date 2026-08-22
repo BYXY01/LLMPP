@@ -29,6 +29,7 @@ Plugin -> PluginManager : plugin part, drop .py files to add tools & hooks
 - **Caller tools** — client-provided `tools` are merged; caller-owned tools are passed back to the client to execute (standard agentic loop).
 - **Auth & key passthrough** — optional API keys via the `LLMPP_API_KEYs` env var; caller-provided keys can be passed through to the provider.
 - **Production WSGI** — served by waitress, not the Flask development server.
+- **MCP client** (experimental) — connect external MCP servers (stdio/HTTP) via the standalone `mcp_bridge.py`; their tools join the tool registry.
 - **Any LLM backend** — OpenAI, LM Studio, Ollama, vLLM, etc. (any OpenAI-compatible base URL).
 
 ## Quick Start
@@ -112,6 +113,35 @@ LLMPP_API_KEYs="my-key-1,my-key-2" python LLMPP.py
 ```bash
 LLMPP_API_KEYs="my-key-1,_PASSTHROUGH_API_KEY" python LLMPP.py
 ```
+
+## MCP client (experimental)
+
+LLMPP can connect to external **MCP servers** (stdio or streamable HTTP) and use their tools alongside plugins. This is **experimental** and entirely optional — if the `mcp` package (or `mcp_bridge.py`) is missing, LLMPP runs normally without MCP.
+
+MCP servers are configured in a **separate** `mcp_config.json` (same directory, not in `config.json`):
+
+```json
+{
+    "servers": [
+        {"name": "math", "command": ["python", "/path/to/mcp_server.py"]},
+        {"name": "remote", "url": "http://127.0.0.1:8000/mcp"}
+    ]
+}
+```
+
+`command` entries use the stdio transport; `url` entries use HTTP. Install the SDK to enable:
+
+```bash
+python -m pip install mcp
+```
+
+List connected tools standalone:
+
+```bash
+python mcp_bridge.py
+```
+
+MCP tool names join the same tool registry as plugins — the model can call them exactly like plugin tools.
 
 ## Plugins
 
@@ -209,7 +239,7 @@ print(resp.choices[0].message.content)
 
 ## Status
 
-Alpha (`v0.0.14`). Core features, auth & key passthrough work; served by waitress (production WSGI) instead of the Flask dev server. Plugin management is planned.
+Alpha (`v0.0.15`). Core features, auth & key passthrough work; served by waitress (production WSGI); experimental MCP client. Plugin management is planned.
 
 ## License
 
