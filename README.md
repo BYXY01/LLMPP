@@ -20,6 +20,7 @@ Plugin -> PluginManager : plugin part, drop .py files to add tools & hooks
 - **Streaming** (experimental) — native mode supports SSE streaming (token-by-token), gated by `server.stream`.
 - **Caller tools** — client-provided `tools` are merged; caller-owned tools are passed back to the client to execute (standard agentic loop).
 - **Auth & key passthrough** — optional API keys via the `LLMPP_API_KEYs` env var; caller-provided keys can be passed through to the provider.
+- **Production WSGI** — served by waitress, not the Flask development server.
 - **Any LLM backend** — OpenAI, LM Studio, Ollama, vLLM, etc. (any OpenAI-compatible base URL).
 
 ## Quick Start
@@ -200,4 +201,4 @@ print(resp.choices[0].message.content)
 
 ## Status
 
-Alpha (`v0.0.13`). Core features, auth & key passthrough work; plugin management is planned.
+Alpha (`v0.0.14`). Core features, auth & key passthrough work; served by waitress (production WSGI) instead of the Flask dev server. Plugin management is planned.

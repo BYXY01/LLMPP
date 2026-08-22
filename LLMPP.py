@@ -39,9 +39,10 @@ import json
 import logging
 import time
 
-ensure_deps([("flask", "flask"), ("openai", "openai")])
+ensure_deps([("flask", "flask"), ("waitress", "waitress"), ("openai", "openai")])
 
 from flask import Flask, jsonify, request
+from waitress import serve
 from openai import OpenAI
 
 logging.basicConfig(
@@ -52,7 +53,7 @@ log = logging.getLogger("LLMPP")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-VERSION = "0.0.13-alpha"
+VERSION = "0.0.14-alpha"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "server": {
@@ -819,7 +820,8 @@ class LLM_Server:
             return None
 
     def run(self, host: str, port: int) -> None:
-        self.app.run(host=host, port=port, debug=False)
+        log.info(f"Serving with waitress (production WSGI) on {host}:{port}")
+        serve(self.app, host=host, port=port)
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ Plugin -> PluginManager : 插件部分，丢 .py 文件即可添加工具与处�
 - **流式输出**（实验）— native 模式支持 SSE 流式（逐 token），由 `server.stream` 开关控制。
 - **调用者工具** — 合并客户端提供的 `tools`；调用者自有工具回传给客户端执行（标准 agentic 循环）。
 - **鉴权与密钥穿透** — 通过 `LLMPP_API_KEYs` 环境变量设置可选鉴权；调用者密钥可穿透给后端供应方。
+- **生产 WSGI** — 由 waitress 托管，非 Flask 开发服务器。
 - **任意 LLM 后端** — OpenAI、LM Studio、Ollama、vLLM 等（任何 OpenAI 兼容 base URL）。
 
 ## 快速开始
@@ -199,4 +200,4 @@ print(resp.choices[0].message.content)
 
 ## 状态
 
-Alpha（`v0.0.13`）。核心功能与鉴权/密钥穿透可用；插件管理为规划项。
+Alpha（`v0.0.14`）。核心功能与鉴权/密钥穿透可用；由 waitress（生产 WSGI）托管而非 Flask 开发服务器。插件管理为规划项。
