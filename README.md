@@ -1,5 +1,13 @@
 # LLMPP - LLM Plugin Proxy
 
+```
+   ______         __    __    __  _______  ____ 
+  /     /|       / /   / /   /  |/  / __ \/ __ \
+ /_____/ |      / /   / /   / /|_/ / /_/ / /_/ /
+ |     | |     / /___/ /___/ /  / / ____/ ____/ 
+ |_____|/     /_____/_____/_/  /_/_/   /_/      
+```
+
 An out-of-the-box, **OpenAI-compatible** middleware that extends any LLM backend with plugin capabilities through a single file.
 
 ```
@@ -202,3 +210,7 @@ print(resp.choices[0].message.content)
 ## Status
 
 Alpha (`v0.0.14`). Core features, auth & key passthrough work; served by waitress (production WSGI) instead of the Flask dev server. Plugin management is planned.
+
+## License
+
+[MIT](LICENSE) © 2026 BYXY01 (XY001)

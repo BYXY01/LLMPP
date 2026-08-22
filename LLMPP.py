@@ -55,6 +55,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 VERSION = "0.0.14-alpha"
 
+BANNER = r"""   ______         __    __    __  _______  ____ 
+  /     /|       / /   / /   /  |/  / __ \/ __ \
+ /_____/ |      / /   / /   / /|_/ / /_/ / /_/ /
+ |     | |     / /___/ /___/ /  / / ____/ ____/ 
+ |_____|/     /_____/_____/_/  /_/_/   /_/      """
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "server": {
         "host": "127.0.0.1",
@@ -872,6 +878,7 @@ def main():
         sys.exit(1)
 
     server = LLM_Server(cfg, manager)
+    print(BANNER, flush=True)
     log.info(f"LLMPP v{VERSION} starting")
     log.info(f"OpenAI-compatible endpoint: http://{host}:{port}/v1/chat/completions")
     if cfg["mode"] == "compatible":
