@@ -17,15 +17,20 @@ from typing import List, Tuple, Any, Callable, Dict, Optional
 def ensure_deps(deps: List[Tuple[str, str]]):
     """Auto-install missing dependencies before importing them.
 
+    Uses pip's Python API (not shell), so package names are never interpreted
+    by a shell -> no command injection from untrusted package strings.
+
     Args:
         deps: List of (import_name, pip_package) pairs.
     """
+    from pip._internal import main as pipmain
+
     for _dep, _pkg in deps:
         try:
             __import__(_dep)
         except ImportError:
             print(f"[deps] installing missing dependency: {_pkg}")
-            os.system(f"{sys.executable} -m pip install {_pkg}")
+            pipmain(["install", _pkg])
 
 import argparse
 import importlib.util
