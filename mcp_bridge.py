@@ -34,6 +34,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 from typing import Any, Dict, List, Optional
 
 from mcp import ClientSession, StdioServerParameters
@@ -61,12 +62,44 @@ def load_config() -> List[Dict[str, Any]]:
 
 
 class MCPClient:
-    """Connect to external MCP servers and expose their tools to LLMPP."""
+    """Connect to external MCP servers and expose their tools to LLMPP.
+
+    Runs its own event loop on a dedicated daemon thread (`start`), so tool
+    calls execute on the MCP thread rather than the caller's. Optional: if
+    `start` is never called, calls fall back to a fresh `asyncio.run`.
+    """
 
     def __init__(self, servers: Optional[List[Dict[str, Any]]] = None):
         self.servers = servers if servers is not None else load_config()
         self._tools: Dict[str, Dict[str, Any]] = {}
         self._tool_owner: Dict[str, str] = {}
+        self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ready = threading.Event()
+
+    # --- lifecycle ---------------------------------------------------------
+
+    def start(self) -> None:
+        """Start the dedicated daemon thread + event loop (idempotent)."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._ready.clear()
+        self._thread = threading.Thread(target=self._run_loop, name="llmpp-mcp", daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=10)
+
+    def stop(self) -> None:
+        """Stop the event loop and join the thread."""
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def _run_loop(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._ready.set()
+        self._loop.run_forever()
 
     # --- public -----------------------------------------------------------
 
@@ -91,6 +124,12 @@ class MCPClient:
                 self._tool_owner[tool_name] = name
         return list(self._tools.values())
 
+    def _run_on_loop(self, coro):
+        """Run an async callable on the MCP thread's loop; else a fresh run."""
+        if self._loop is not None and self._loop.is_running():
+            return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+        return asyncio.run(coro)
+
     def call(self, name: str, args: Dict[str, Any]) -> str:
         """Execute a tool on its owning MCP server; return the result as text."""
         owner = self._tool_owner.get(name)
@@ -100,13 +139,16 @@ class MCPClient:
         if srv is None:
             return f"[error] MCP server not found: {owner}"
         try:
-            result = asyncio.run(self._call_server_tool(srv, name, args))
-            return result
+            return self._run_on_loop(self._call_server_tool(srv, name, args))
         except BaseException as e:
             return f"[error] MCP tool call failed: {e}"
 
     async def call_async(self, name: str, args: Dict[str, Any]) -> str:
-        """Async version of call(); for use inside a running event loop."""
+        """Async version of call(); for use inside a running event loop.
+
+        If the dedicated MCP thread is running, the call is dispatched there
+        and awaited here; otherwise it runs in the current loop directly.
+        """
         owner = self._tool_owner.get(name)
         if owner is None:
             return f"[error] MCP tool not found: {name}"
@@ -114,6 +156,10 @@ class MCPClient:
         if srv is None:
             return f"[error] MCP server not found: {owner}"
         try:
+            if self._loop is not None and self._loop.is_running() and self._loop is not asyncio.get_running_loop():
+                return await asyncio.wrap_future(
+                    asyncio.run_coroutine_threadsafe(self._call_server_tool(srv, name, args), self._loop)
+                )
             return await self._call_server_tool(srv, name, args)
         except BaseException as e:
             return f"[error] MCP tool call failed: {e}"

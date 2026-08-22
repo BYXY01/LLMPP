@@ -111,9 +111,14 @@ class PluginManager:
         self._mgmt_thread = threading.Thread(target=self._mgmt_loop, name="llmpp-manager", daemon=True)
         self._mgmt_thread.start()
         log.info("PluginManager management thread started")
+        if self.mcp_client:
+            self.mcp_client.start()
+            log.info("MCP client thread started")
 
     def stop(self) -> None:
         """Signal the management thread to exit."""
+        if self.mcp_client:
+            self.mcp_client.stop()
         if self._mgmt_thread is not None and self._mgmt_thread.is_alive():
             self._mgmt_queue.put(None)
             self._mgmt_thread.join(timeout=5)
