@@ -27,6 +27,8 @@ Plugin -> PluginManager : plugin part, drop .py files to add tools & hooks
 - **Plugin deps** — a plugin can declare `__deps__` and LLMPP auto-installs them.
 - **Streaming** (experimental) — native mode supports SSE streaming (token-by-token), gated by `server.stream`.
 - **Async & threaded** — async request pipeline (AsyncOpenAI); PluginManager management runs on its own thread, sharing a locked registry.
+- **Dual protocols** — OpenAI `/v1/chat/completions` and Anthropic `/v1/messages` inbound; `llm.provider` selects OpenAI or Anthropic backend.
+- **Full `/v1/*` passthrough** — optional `routes.full_v1` proxies models/embeddings/etc. to the backend.
 - **Modular files** — `plugin_manager.py`, `llm_server.py`, and the `LLMPP.py` entry split the two main classes.
 - **Caller tools** — client-provided `tools` are merged; caller-owned tools are passed back to the client to execute (standard agentic loop).
 - **Auth & key passthrough** — optional API keys via the `LLMPP_API_KEYs` env var; caller-provided keys can be passed through to the provider.
@@ -83,7 +85,9 @@ python LLMPP.py
 | `server.stream` | Enable SSE streaming (experimental, native mode only). |
 | `server.api_keys` | LLMPP auth keys (max 5); may include `_PASSTHROUGH_API_KEY`. See "Auth & key passthrough". |
 | `llm.api_base` / `api_key` | Your OpenAI-compatible backend (LM Studio, Ollama, vLLM, ...). |
+| `llm.provider` | Backend format: `openai` (default) or `anthropic` (Claude). |
 | `mode` | `native` (function calling) or `compatible` (text protocol). |
+| `routes.full_v1` | Proxy the whole `/v1/*` namespace (models, embeddings, ...) to the backend. |
 | `tools.max_rounds` | Max tool-call rounds per request (safety valve against loops). |
 | `hooks.inbound` / `hooks.outbound` | Name of the inbound/outbound hook plugin to use. |
 | `manager_plugin` | Name of the single authorized manager function (list/enable/disable/reload). |
@@ -269,7 +273,7 @@ print(resp.choices[0].message.content)
 
 ## Status
 
-Alpha (`v0.0.17`). Core features, auth & key passthrough, plugin management, experimental MCP client; async pipeline + threaded architecture, served by waitress.
+Alpha (`v0.0.18`). Core features, auth & key passthrough, plugin management, experimental MCP client; async pipeline + threaded architecture, dual OpenAI/Anthropic protocols & backends, full `/v1/*` passthrough.
 
 ## License
 

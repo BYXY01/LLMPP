@@ -5,6 +5,8 @@ __pycache__/
 dist/
 build/
 .venv/
+.vscode/
+pyrightconfig.json
 config.json
 mcp_config.json
 plugins.json

@@ -27,6 +27,8 @@ Plugin -> PluginManager : 插件部分，丢 .py 文件即可添加工具与 hoo
 - **插件依赖** — 插件可声明 `__deps__`，LLMPP 自动安装。
 - **流式输出**（实验）— native 模式支持 SSE 流式（逐 token），由 `server.stream` 开关控制。
 - **异步与线程化** — 异步请求管线（AsyncOpenAI）；PluginManager 管理运行于独立线程，共享加锁注册表。
+- **双协议** — 入站支持 OpenAI `/v1/chat/completions` 与 Anthropic `/v1/messages`；`llm.provider` 选择 OpenAI 或 Anthropic 后端。
+- **完整 `/v1/*` 透传** — 可选 `routes.full_v1` 将 models、embeddings 等透传到后端。
 - **模块化文件** — `plugin_manager.py`、`llm_server.py` 与 `LLMPP.py` 入口拆分两大主类。
 - **调用者工具** — 合并客户端提供的 `tools`；调用者自有工具回传给客户端执行（标准 agentic 循环）。
 - **鉴权与密钥穿透** — 通过 `LLMPP_API_KEYs` 环境变量设置可选鉴权；调用者密钥可穿透给后端供应方。
@@ -83,7 +85,9 @@ python LLMPP.py
 | `server.stream` | 启用 SSE 流式（实验，仅 native 模式）。 |
 | `server.api_keys` | LLMPP 鉴权 key（最多 5 个）；可含 `_PASSTHROUGH_API_KEY`。见"鉴权与密钥穿透"。 |
 | `llm.api_base` / `api_key` | 你的 OpenAI 兼容后端（LM Studio、Ollama、vLLM 等）。 |
+| `llm.provider` | 后端格式：`openai`（默认）或 `anthropic`（Claude）。 |
 | `mode` | `native`（函数调用）或 `compatible`（文本协议）。 |
+| `routes.full_v1` | 将完整 `/v1/*` 命名空间（models、embeddings 等）透传到后端。 |
 | `tools.max_rounds` | 单次请求内工具调用轮数上限（防死循环安全阀）。 |
 | `hooks.inbound` / `hooks.outbound` | 使用的入站 / 出站处理器插件名。 |
 | `manager_plugin` | 唯一管理授权函数名（列出/启用/禁用/重载）。 |
@@ -263,7 +267,7 @@ print(resp.choices[0].message.content)
 
 ## 状态
 
-Alpha（`v0.0.17`）。核心功能、鉴权与密钥穿透、插件管理、实验性 MCP 客户端可用；异步管线 + 线程化架构，由 waitress 托管。
+Alpha（`v0.0.18`）。核心功能、鉴权与密钥穿透、插件管理、实验性 MCP 客户端可用；异步管线 + 线程化架构，双 OpenAI/Anthropic 协议与后端，完整 `/v1/*` 透传。
 
 ## 许可证
 

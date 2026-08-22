@@ -13,15 +13,71 @@ import asyncio
 import inspect
 import json
 import logging
+import queue
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request, Response
 from openai import AsyncOpenAI
 
+try:
+    from anthropic import AsyncAnthropic
+except ImportError:
+    AsyncAnthropic = None  # type: ignore[assignment,misc]
+
 from plugin_manager import PluginManager
 
 log = logging.getLogger("LLMPP")
+
+
+def _json_parse(s: str) -> Any:
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _block_content_to_str(content) -> str:
+    """Convert an Anthropic content value (str | list of blocks) to a string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return str(content)
+
+
+def _tc_get(tc, attr: str) -> Any:
+    """Read an attribute from a tool call that may be an object or a dict."""
+    if isinstance(tc, dict):
+        return tc.get(attr)
+    return getattr(tc, attr, None)
+
+
+def _tc_function(tc) -> Any:
+    """Get the function part of a tool call (object or dict)."""
+    if isinstance(tc, dict):
+        return tc.get("function", {})
+    return getattr(tc, "function", None)
+
+
+def _tc_name(tc) -> str:
+    fn = _tc_function(tc)
+    if isinstance(fn, dict):
+        return str(fn.get("name", ""))
+    return str(getattr(fn, "name", ""))
+
+
+def _tc_args(tc) -> str:
+    fn = _tc_function(tc)
+    if isinstance(fn, dict):
+        return str(fn.get("arguments", ""))
+    return str(getattr(fn, "arguments", ""))
+
+
+def _tc_id(tc) -> str:
+    return str(_tc_get(tc, "id") or "")
 
 
 class LLM_Server:
@@ -46,11 +102,24 @@ class LLM_Server:
         self.cfg = cfg
         self.manager = manager
         self.llm_cfg = cfg["llm"]
+        self.provider = str(self.llm_cfg.get("provider", "openai")).lower()
         self.client = AsyncOpenAI(
             base_url=self.llm_cfg["api_base"],
             api_key=self.llm_cfg.get("api_key", "not-needed"),
             timeout=self.llm_cfg.get("timeout", 120),
         )
+        self.anthropic_client = None
+        if self.provider == "anthropic":
+            if AsyncAnthropic is None:
+                raise RuntimeError("provider=anthropic requires the 'anthropic' package; pip install anthropic")
+            anth_base = self.llm_cfg["api_base"].rstrip("/")
+            if anth_base.endswith("/v1"):
+                anth_base = anth_base[:-3]
+            self.anthropic_client = AsyncAnthropic(
+                api_key=self.llm_cfg.get("api_key", "not-needed"),
+                base_url=anth_base + "/",
+                timeout=self.llm_cfg.get("timeout", 120),
+            )
         # Auth keys: server.api_keys first, env LLMPP_API_KEYs as fallback
         # (comma-separated). Max 5.
         # Unset -> LLMPP auth disabled, always uses llm.api_key.
@@ -80,6 +149,15 @@ class LLM_Server:
         def chat_completions():
             return self._handle_chat()
 
+        @app.route("/v1/messages", methods=["POST"])
+        def anthropic_messages():
+            return asyncio.run(self._handle_anthropic())
+
+        if self.cfg["routes"].get("full_v1", False):
+            @app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+            def proxy_v1(path):
+                return asyncio.run(self._proxy_v1(path))
+
         @app.get("/")
         def index():
             return jsonify(
@@ -93,15 +171,71 @@ class LLM_Server:
                 }
             )
 
+    async def _proxy_v1(self, path: str):
+        """Proxy an arbitrary /v1/* request to the matching backend.
+
+        Format consistency is enforced: the passthrough only forwards paths
+        whose format matches the configured backend provider. Anthropic-format
+        paths (e.g. messages, count_tokens) are only forwarded when
+        provider=anthropic; other paths only when provider=openai.
+        """
+        backend_key, auth_err = self._resolve_backend_key()
+        if auth_err:
+            return auth_err
+        anth_only = {"messages", "count_tokens", "complete"}
+        openai_only = {"embeddings", "completions", "fine_tuning", "fine-tunes", "images", "audio", "moderations", "batches", "uploads"}
+        base = self.llm_cfg["api_base"].rstrip("/")
+        first = path.split("/", 1)[0]
+        if self.provider == "anthropic":
+            if first in openai_only:
+                return jsonify({"error": {"message": f"OpenAI path '/v1/{path}' requires provider=openai", "type": "invalid_request_error"}}), 400
+            if base.endswith("/v1"):
+                base = base[:-3]
+            url = f"{base}/{path}"
+        else:
+            if first in anth_only:
+                return jsonify({"error": {"message": f"Anthropic path '/v1/{path}' requires provider=anthropic", "type": "invalid_request_error"}}), 400
+            if base.endswith("/v1"):
+                url = f"{base}/{path}"
+            else:
+                url = f"{base}/v1/{path}"
+        import httpx
+
+        headers = {"Authorization": f"Bearer {backend_key or self.llm_cfg.get('api_key', 'not-needed')}"}
+        if request.content_type:
+            headers["Content-Type"] = request.content_type
+        payload = None
+        if request.data:
+            try:
+                payload = json.loads(request.data)
+            except json.JSONDecodeError:
+                payload = request.data.decode("utf-8", errors="replace")
+        async with httpx.AsyncClient(timeout=self.llm_cfg.get("timeout", 120)) as client:
+            resp = await client.request(
+                method=request.method,
+                url=url,
+                headers=headers,
+                json=payload if isinstance(payload, (dict, list)) else None,
+                content=payload if isinstance(payload, str) else None,
+            )
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("content-type", "application/json"))
+
     # --- main flow ---------------------------------------------------------
 
     def _handle_chat(self):
         """Synchronous Flask entry; drives the async request on a fresh loop."""
         return asyncio.run(self._process_request())
 
-    async def _process_request(self):
+    async def _process_request(self, payload: Optional[Dict[str, Any]] = None):
+        """Process a chat request in OpenAI format.
+
+        `payload` defaults to the Flask request body; Anthropic entry converts
+        and passes an OpenAI-format payload here.
+        """
         client_ip = request.remote_addr
-        payload = request.get_json(force=True)
+        if payload is None:
+            payload = request.get_json(force=True)
+        assert payload is not None
         log.info(f"Request from {client_ip}")
         messages = payload.get("messages", [])
         if not isinstance(messages, list):
@@ -129,6 +263,127 @@ class LLM_Server:
             )
 
         return await self._run_pipeline(model, messages, client_tools, backend_key)
+
+    # --- Anthropic inbound (caller side) -----------------------------------
+
+    async def _handle_anthropic(self):
+        """Handle /v1/messages (Anthropic format) -> convert to OpenAI -> run -> convert back."""
+        payload = request.get_json(force=True)
+        try:
+            openai_payload = self._from_anthropic_request(payload)
+        except Exception as e:
+            log.error(f"Anthropic request conversion failed: {e}")
+            return jsonify({"error": {"message": str(e), "type": "invalid_request_error"}}), 400
+        result = await self._process_request(openai_payload)
+        if isinstance(result, tuple):
+            # Error responses come back as (response, status_code); pass through.
+            return result
+        # Success: convert the OpenAI chat response to Anthropic format.
+        return self._to_anthropic_response(result)
+
+    @staticmethod
+    def _from_anthropic_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert an Anthropic /v1/messages payload to an OpenAI chat payload."""
+        messages: List[Dict[str, Any]] = []
+        for m in payload.get("messages", []):
+            role = m.get("role", "user")
+            content = m.get("content")
+            if isinstance(content, str):
+                messages.append({"role": "assistant" if role == "assistant" else "user", "content": content})
+                continue
+            if isinstance(content, list):
+                text_parts = []
+                tool_calls = []
+                for block in content:
+                    btype = block.get("type")
+                    if btype == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif btype == "tool_use":
+                        tool_calls.append(
+                            {
+                                "id": block.get("id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name", ""),
+                                    "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
+                                },
+                            }
+                        )
+                    elif btype == "tool_result":
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": block.get("tool_use_id", ""),
+                                "content": _block_content_to_str(block.get("content")),
+                            }
+                        )
+                if role == "assistant":
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": "".join(text_parts) or None,
+                            "tool_calls": tool_calls or None,
+                        }
+                    )
+                elif text_parts:
+                    messages.append({"role": "user", "content": "".join(text_parts)})
+        # tools: input_schema -> function parameters
+        tools = []
+        for t in payload.get("tools", []):
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name", ""),
+                        "description": t.get("description", ""),
+                        "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+                    },
+                }
+            )
+        out: Dict[str, Any] = {
+            "model": payload.get("model", ""),
+            "messages": messages,
+        }
+        if tools:
+            out["tools"] = tools
+        if payload.get("stream"):
+            out["stream"] = True
+        return out
+
+    def _to_anthropic_response(self, flask_resp) -> Any:
+        """Convert an OpenAI chat completion response into Anthropic format."""
+        data = flask_resp.get_json()
+        if isinstance(data, dict) and data.get("error"):
+            return jsonify(data), getattr(flask_resp, "status_code", 500)
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message", {})
+        content_blocks: List[Dict[str, Any]] = []
+        if message.get("content"):
+            content_blocks.append({"type": "text", "text": message["content"]})
+        for tc in message.get("tool_calls", []):
+            fn = tc.get("function", {})
+            content_blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "input": _json_parse(fn.get("arguments", "{}")),
+                }
+            )
+        resp = {
+            "id": data.get("id", "msg_" + str(int(time.time()))),
+            "type": "message",
+            "role": "assistant",
+            "model": data.get("model", ""),
+            "content": content_blocks,
+            "stop_reason": "tool_use" if message.get("tool_calls") else "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+        }
+        return jsonify(resp)
 
     def _resolve_backend_key(self) -> Tuple[Optional[str], Optional[Any]]:
         """Resolve the backend API key from the request's Authorization header.
@@ -269,7 +524,7 @@ class LLM_Server:
                         final_content = msg.content or ""
                         messages.append({"role": "assistant", "content": final_content})
                         break
-                    foreign = [tc for tc in msg.tool_calls if not self.manager.has_tool(tc.function.name)]
+                    foreign = [tc for tc in msg.tool_calls if not self.manager.has_tool(_tc_name(tc))]
                     if foreign:
                         pending_tool_calls = list(msg.tool_calls)
                         messages.append(
@@ -278,9 +533,9 @@ class LLM_Server:
                                 "content": msg.content,
                                 "tool_calls": [
                                     {
-                                        "id": tc.id,
+                                        "id": _tc_id(tc),
                                         "type": "function",
-                                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                                        "function": {"name": _tc_name(tc), "arguments": _tc_args(tc)},
                                     }
                                     for tc in msg.tool_calls
                                 ],
@@ -428,6 +683,8 @@ class LLM_Server:
         response_format: Optional[Dict[str, Any]] = None,
         api_key: Optional[str] = None,
     ) -> Any:
+        if self.provider == "anthropic":
+            return await self._call_anthropic(model, messages, tools, stream, api_key)
         kwargs: Dict[str, Any] = {"model": model, "messages": messages}
         if tools:
             kwargs["tools"] = tools
@@ -447,13 +704,132 @@ class LLM_Server:
             return resp
         return resp.choices[0].message
 
+    # --- Anthropic provider -----------------------------------------------
+
+    @staticmethod
+    def _to_anthropic_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert OpenAI-format messages to Anthropic messages."""
+        out: List[Dict[str, Any]] = []
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content")
+            if role == "system":
+                out.append({"role": "user", "content": f"[system] {content}"})
+                continue
+            if role == "tool":
+                # tool result -> user message with tool_result block
+                out.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": m.get("tool_call_id", ""),
+                                "content": str(content),
+                            }
+                        ],
+                    }
+                )
+                continue
+            if role == "assistant" and m.get("tool_calls"):
+                blocks: List[Dict[str, Any]] = []
+                if content:
+                    blocks.append({"type": "text", "text": str(content)})
+                for tc in m.get("tool_calls", []):
+                    fn = tc.get("function", {})
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": tc.get("id", ""),
+                            "name": fn.get("name", ""),
+                            "input": _json_parse(fn.get("arguments", "{}")),
+                        }
+                    )
+                out.append({"role": "assistant", "content": blocks})
+                continue
+            out.append({"role": role if role in ("user", "assistant") else "user", "content": str(content) if content else ""})
+        return out
+
+    @staticmethod
+    def _to_anthropic_tools(tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+        """Convert OpenAI tool schemas to Anthropic tool schemas."""
+        if not tools:
+            return None
+        result = []
+        for t in tools:
+            fn = t.get("function", {})
+            result.append(
+                {
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+                }
+            )
+        return result
+
+    @staticmethod
+    def _from_anthropic_message(result) -> Any:
+        """Convert an Anthropic message into an OpenAI-style message object."""
+        content_text = ""
+        tool_calls = []
+        blocks = getattr(result, "content", [])
+        for block in blocks:
+            btype = getattr(block, "type", "")
+            if btype == "text":
+                content_text += getattr(block, "text", "")
+            elif btype == "tool_use":
+                tool_calls.append(
+                    {
+                        "id": getattr(block, "id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(block, "name", ""),
+                            "arguments": json.dumps(getattr(block, "input", {}), ensure_ascii=False),
+                        },
+                    }
+                )
+        class _Msg:
+            pass
+
+        msg = _Msg()  # type: ignore[attr-defined]
+        msg.content = content_text  # type: ignore[attr-defined]
+        msg.tool_calls = tool_calls or None  # type: ignore[attr-defined]
+        return msg
+
+    async def _call_anthropic(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        stream: bool = False,
+        api_key: Optional[str] = None,
+    ) -> Any:
+        """Call Claude (Anthropic) with OpenAI-format inputs; return OpenAI-style."""
+        if self.anthropic_client is None:
+            raise RuntimeError("anthropic client not initialized")
+        client = self.anthropic_client
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": self._to_anthropic_messages(messages),
+            "max_tokens": 4096,
+        }
+        a_tools = self._to_anthropic_tools(tools)
+        if a_tools:
+            kwargs["tools"] = a_tools
+        if stream:
+            kwargs["stream"] = True
+        resp = await client.messages.create(**kwargs)
+        if stream:
+            return resp
+        return self._from_anthropic_message(resp)
+
     def _call_sync(self, *args, **kwargs) -> Any:
         """Synchronous wrapper around `_call` (non-streaming)."""
         return asyncio.run(self._call(*args, **kwargs))
 
     def _iter_stream_sync(self, *args, **kwargs):
         """Consume an async streaming response inside one loop, yielding chunks."""
-        chunk_q: "queue.Queue[Optional[Any]]" = __import__("queue").Queue()
+        chunk_q: "queue.Queue[Optional[Any]]" = queue.Queue()
 
         async def _consume():
             try:
@@ -542,15 +918,15 @@ class LLM_Server:
             },
         }
 
-    def _parse_compat(self, content: str):
+    def _parse_compat(self, content: str) -> Optional[Tuple[str, Any]]:
         """Parse a compatible-mode reply into (action, args) or None."""
         data = self._try_parse_json(content)
         if not isinstance(data, dict):
             return None
         if "call_function" in data:
-            return data["call_function"], data.get("arg", {})
+            return str(data["call_function"]), data.get("arg", {})
         if "action" in data:
-            return data.get("action"), data.get("args", {})
+            return str(data.get("action")), data.get("args", {})
         return None
 
     @staticmethod

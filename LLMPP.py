@@ -33,7 +33,9 @@ def ensure_deps(deps: List[Tuple[str, str]]):
     Args:
         deps: List of (import_name, pip_package) pairs.
     """
-    from pip._internal import main as pipmain
+    import importlib
+
+    pipmain = importlib.import_module("pip._internal").main
 
     for _dep, _pkg in deps:
         try:
@@ -48,7 +50,7 @@ ensure_deps([("flask", "flask"), ("waitress", "waitress"), ("openai", "openai")]
 from llm_server import LLM_Server  # noqa: E402
 from plugin_manager import PluginManager  # noqa: E402
 
-VERSION = "0.0.17-alpha"
+VERSION = "0.0.18-alpha"
 
 BANNER = r"""   ______         __    __    __  _______  ____ 
   /     /|       / /   / /   /  |/  / __ \/ __ \
@@ -81,8 +83,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "api_base": "http://127.0.0.1:11434/v1",
         "api_key": "ollama",
         "timeout": 120,
+        "provider": "openai",  # openai | anthropic (backend format)
     },
     "mode": "native",  # native | compatible
+    "routes": {
+        # full_v1: proxy the whole /v1/* namespace (models, embeddings, etc.)
+        # to the backend. False keeps only /v1/chat/completions + /v1/messages.
+        "full_v1": False,
+    },
     "tools": {
         "max_rounds": 10,
     },

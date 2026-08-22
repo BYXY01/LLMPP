@@ -157,8 +157,9 @@ class MCPClient:
                 result = await session.call_tool(name, args)
                 parts = []
                 for item in result.content:
-                    if hasattr(item, "text"):
-                        parts.append(item.text)
+                    text = getattr(item, "text", None)
+                    if text:
+                        parts.append(str(text))
                     else:
                         parts.append(str(item))
                 return "\n".join(parts)

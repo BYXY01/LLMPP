@@ -37,7 +37,9 @@ def ensure_deps(deps: List[Tuple[str, str]]):
     Args:
         deps: List of (import_name, pip_package) pairs.
     """
-    from pip._internal import main as pipmain
+    import importlib
+
+    pipmain = importlib.import_module("pip._internal").main
 
     for _dep, _pkg in deps:
         try:
