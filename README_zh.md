@@ -8,16 +8,16 @@
  |_____|/     /_____/_____/_/  /_/_/   /_/      
 ```
 
-一个**开箱即用**的 OpenAI 兼容中间件，通过单个文件为任意 LLM 后端扩展插件能力。
+一个**开箱即用**的 OpenAI 兼容中间件，通过插件系统为任意 LLM 后端扩展能力。
 
 ```
 LLM    -> LLM_Server    : 代理部分，OpenAI 进 / OpenAI 出
-Plugin -> PluginManager : 插件部分，丢 .py 文件即可添加工具与处理器
+Plugin -> PluginManager : 插件部分，丢 .py 文件即可添加工具与 hooks
 ```
 
 ## 特性
 
-- **单文件** — 只有一个 `LLMPP.py`，零项目搭建成本。启动时自动安装缺失的核心依赖。
+- **零配置运行** — 启动时自动安装缺失的核心依赖。
 - **OpenAI 兼容 API** — `POST /v1/chat/completions`，兼容任何 OpenAI SDK / 客户端。
 - **即插即用插件** — 把 `.py` 文件丢进 `plugins/`，启动时自动加载。
 - **双协议**：
@@ -26,6 +26,8 @@ Plugin -> PluginManager : 插件部分，丢 .py 文件即可添加工具与处�
 - **消息处理器** — 入站 / 出站处理器各 1 个，在配置中指定；出站支持可选流式块。
 - **插件依赖** — 插件可声明 `__deps__`，LLMPP 自动安装。
 - **流式输出**（实验）— native 模式支持 SSE 流式（逐 token），由 `server.stream` 开关控制。
+- **异步与线程化** — 异步请求管线（AsyncOpenAI）；PluginManager 管理运行于独立线程，共享加锁注册表。
+- **模块化文件** — `plugin_manager.py`、`llm_server.py` 与 `LLMPP.py` 入口拆分两大主类。
 - **调用者工具** — 合并客户端提供的 `tools`；调用者自有工具回传给客户端执行（标准 agentic 循环）。
 - **鉴权与密钥穿透** — 通过 `LLMPP_API_KEYs` 环境变量设置可选鉴权；调用者密钥可穿透给后端供应方。
 - **生产 WSGI** — 由 waitress 托管，非 Flask 开发服务器。
@@ -261,7 +263,7 @@ print(resp.choices[0].message.content)
 
 ## 状态
 
-Alpha（`v0.0.16`）。核心功能、鉴权与密钥穿透、插件管理、实验性 MCP 客户端可用；由 waitress（生产 WSGI）托管。
+Alpha（`v0.0.17`）。核心功能、鉴权与密钥穿透、插件管理、实验性 MCP 客户端可用；异步管线 + 线程化架构，由 waitress 托管。
 
 ## 许可证
 

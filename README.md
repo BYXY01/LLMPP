@@ -8,7 +8,7 @@
  |_____|/     /_____/_____/_/  /_/_/   /_/      
 ```
 
-An out-of-the-box, **OpenAI-compatible** middleware that extends any LLM backend with plugin capabilities through a single file.
+An out-of-the-box, **OpenAI-compatible** middleware that extends any LLM backend with plugin capabilities.
 
 ```
 LLM  -> LLM_Server  : proxy part, OpenAI in / OpenAI out
@@ -17,7 +17,7 @@ Plugin -> PluginManager : plugin part, drop .py files to add tools & hooks
 
 ## Features
 
-- **Single file** — one `LLMPP.py`, zero project setup. Auto-installs missing core deps on boot.
+- **Zero-setup run** — auto-installs missing core deps on boot.
 - **OpenAI-compatible API** — `POST /v1/chat/completions`, works with any OpenAI SDK/client.
 - **Drop-in plugins** — put `.py` files in `plugins/`, they auto-load on startup.
 - **Two protocols**:
@@ -26,6 +26,8 @@ Plugin -> PluginManager : plugin part, drop .py files to add tools & hooks
 - **Hooks** — inbound/outbound message processors (1 each, chosen in config). Outbound supports optional streaming chunks.
 - **Plugin deps** — a plugin can declare `__deps__` and LLMPP auto-installs them.
 - **Streaming** (experimental) — native mode supports SSE streaming (token-by-token), gated by `server.stream`.
+- **Async & threaded** — async request pipeline (AsyncOpenAI); PluginManager management runs on its own thread, sharing a locked registry.
+- **Modular files** — `plugin_manager.py`, `llm_server.py`, and the `LLMPP.py` entry split the two main classes.
 - **Caller tools** — client-provided `tools` are merged; caller-owned tools are passed back to the client to execute (standard agentic loop).
 - **Auth & key passthrough** — optional API keys via the `LLMPP_API_KEYs` env var; caller-provided keys can be passed through to the provider.
 - **Production WSGI** — served by waitress, not the Flask development server.
@@ -267,7 +269,7 @@ print(resp.choices[0].message.content)
 
 ## Status
 
-Alpha (`v0.0.16`). Core features, auth & key passthrough, plugin management, experimental MCP client; served by waitress (production WSGI).
+Alpha (`v0.0.17`). Core features, auth & key passthrough, plugin management, experimental MCP client; async pipeline + threaded architecture, served by waitress.
 
 ## License
 

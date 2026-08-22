@@ -105,6 +105,19 @@ class MCPClient:
         except BaseException as e:
             return f"[error] MCP tool call failed: {e}"
 
+    async def call_async(self, name: str, args: Dict[str, Any]) -> str:
+        """Async version of call(); for use inside a running event loop."""
+        owner = self._tool_owner.get(name)
+        if owner is None:
+            return f"[error] MCP tool not found: {name}"
+        srv = next((s for s in self.servers if s.get("name") == owner), None)
+        if srv is None:
+            return f"[error] MCP server not found: {owner}"
+        try:
+            return await self._call_server_tool(srv, name, args)
+        except BaseException as e:
+            return f"[error] MCP tool call failed: {e}"
+
     # --- internals --------------------------------------------------------
 
     @staticmethod
